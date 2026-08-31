@@ -1,0 +1,121 @@
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import log_loss, roc_auc_score
+
+
+def _as_arrays(y, p) -> tuple[np.ndarray, np.ndarray]:
+    y = np.asarray(y, dtype=float)
+    p = np.clip(np.asarray(p, dtype=float), 1e-6, 1.0 - 1e-6)
+    return y, p
+
+
+def auc(y, p) -> float:
+    y, p = _as_arrays(y, p)
+    if len(y) == 0 or y.min() == y.max() or p.min() == p.max():
+        return float("nan")
+    return float(roc_auc_score(y, p))
+
+
+def gini(y, p) -> float:
+    a = auc(y, p)
+    if np.isnan(a):
+        return float("nan")
+    return 2.0 * a - 1.0
+
+
+def ks_stat(y, p) -> float:
+    y, p = _as_arrays(y, p)
+    n_bad = y.sum()
+    n_good = len(y) - n_bad
+    if n_bad == 0 or n_good == 0:
+        return float("nan")
+    order = np.argsort(p)
+    y_sorted = y[order]
+    cdf_bad = np.cumsum(y_sorted) / n_bad
+    cdf_good = np.cumsum(1.0 - y_sorted) / n_good
+    return float(np.max(np.abs(cdf_bad - cdf_good)))
+
+
+def brier(y, p) -> float:
+    y, p = _as_arrays(y, p)
+    if len(y) == 0:
+        return float("nan")
+    return float(np.mean((p - y) ** 2))
+
+
+def logloss(y, p) -> float:
+    y, p = _as_arrays(y, p)
+    if len(y) == 0 or y.min() == y.max():
+        return float("nan")
+    return float(log_loss(y, p, labels=[0.0, 1.0]))
+
+
+def observed_expected(y, p) -> dict[str, float]:
+    y, p = _as_arrays(y, p)
+    if len(y) == 0:
+        return {"n": 0.0, "defaults": 0.0, "obs_rate": float("nan"), "mean_pd": float("nan"), "oe": float("nan")}
+    mean_pd = float(p.mean())
+    obs_rate = float(y.mean())
+    oe = obs_rate / mean_pd if mean_pd > 0 else float("nan")
+    return {
+        "n": float(len(y)),
+        "defaults": float(y.sum()),
+        "obs_rate": obs_rate,
+        "mean_pd": mean_pd,
+        "oe": oe,
+    }
+
+
+def ece(y, p, n_bins: int = 10) -> float:
+    y, p = _as_arrays(y, p)
+    if len(y) < n_bins:
+        n_bins = max(int(len(y)), 1)
+    try:
+        ranks = pd.qcut(p, q=n_bins, duplicates="drop")
+    except ValueError:
+        return float("nan")
+    df = pd.DataFrame({"y": y, "p": p, "bin": ranks})
+    grouped = df.groupby("bin", observed=True)
+    if grouped.ngroups == 0:
+        return float("nan")
+    abs_err = (grouped["p"].mean() - grouped["y"].mean()).abs()
+    weights = grouped.size() / len(df)
+    return float((abs_err * weights).sum())
+
+
+def hosmer_lemeshow(y, p, n_bins: int = 10) -> dict[str, float]:
+    y, p = _as_arrays(y, p)
+    out = {"hl_stat": float("nan"), "hl_df": float("nan")}
+    if len(y) < n_bins:
+        return out
+    try:
+        ranks = pd.qcut(p, q=n_bins, duplicates="drop")
+    except ValueError:
+        return out
+    df = pd.DataFrame({"y": y, "p": p, "bin": ranks})
+    g = df.groupby("bin", observed=True)
+    n = g.size().to_numpy(dtype=float)
+    obs = g["y"].sum().to_numpy(dtype=float)
+    exp = g["p"].sum().to_numpy(dtype=float)
+    var = np.clip(exp * (1.0 - exp / np.clip(n, 1.0, None)), 1e-12, None)
+    stat = float(np.sum((obs - exp) ** 2 / var))
+    out["hl_stat"] = stat
+    out["hl_df"] = float(max(len(n) - 2, 1))
+    return out
+
+
+def performance_bundle(y, p, n_ece_bins: int = 10) -> dict[str, float]:
+    oe = observed_expected(y, p)
+    hl = hosmer_lemeshow(y, p, n_bins=n_ece_bins)
+    return {
+        **oe,
+        "gini": gini(y, p),
+        "auc": auc(y, p),
+        "ks": ks_stat(y, p),
+        "brier": brier(y, p),
+        "logloss": logloss(y, p),
+        "ece": ece(y, p, n_bins=n_ece_bins),
+        **hl,
+    }
