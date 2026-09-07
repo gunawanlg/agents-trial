@@ -1,0 +1,14 @@
+{
+  "SKP_CREDIT_CASE": {
+    "col_target": "TargetDefault",
+    "col_obs": "TargetDefaultObs"
+  },
+  "PortfolioA": {
+    "col_target": "TargetA",
+    "col_obs": "TargetAObs"
+  },
+  "PortfolioB": {
+    "col_target": "TargetB",
+    "col_obs": "TargetBObs"
+  }
+}

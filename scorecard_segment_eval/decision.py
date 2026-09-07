@@ -1,29 +1,36 @@
-from __future__ import annotations
+from typing import List, Optional, Tuple
 
 from scorecard_segment_eval.schema import Gates
 
 
-def has_power(n: float, defaults: float, gates: Gates) -> bool:
+def has_power(n, defaults, gates):
+    # type: (float, float, Gates) -> bool
     return n >= gates.min_n and defaults >= gates.min_events
 
 
-def rank_order_pass(gini_seg: float, gini_ci_low: float, gini_overall: float, gates: Gates) -> bool:
+def rank_order_pass(gini_seg, gini_ci_low, gini_overall, gates):
+    # type: (float, float, float, Gates) -> bool
     if not (gini_seg == gini_seg):  # NaN
         return False
-    ratio = gini_seg / gini_overall if gini_overall and gini_overall == gini_overall and gini_overall != 0 else float("nan")
+    if gini_overall and gini_overall == gini_overall and gini_overall != 0:
+        ratio = gini_seg / gini_overall
+    else:
+        ratio = float("nan")
     absolute_ok = gini_seg >= gates.gini_floor
     relative_ok = ratio == ratio and ratio >= gates.gini_ratio_floor
     ci_clears_floor = gini_ci_low == gini_ci_low and gini_ci_low >= gates.gini_floor
     return absolute_ok and (relative_ok or ci_clears_floor)
 
 
-def calibration_pass(oe: float, ece_val: float, gates: Gates) -> bool:
+def calibration_pass(oe, ece_val, gates):
+    # type: (float, float, Gates) -> bool
     if not (oe == oe) or not (ece_val == ece_val):
         return False
     return gates.oe_lo <= oe <= gates.oe_hi and ece_val <= gates.ece_max
 
 
-def stability_pass(latest_to_early_gini_ratio: float | None, gates: Gates) -> tuple[bool, bool]:
+def stability_pass(latest_to_early_gini_ratio, gates):
+    # type: (Optional[float], Gates) -> Tuple[bool, bool]
     """Returns (pass, is_warn_only). Fail only on a severe configured drop."""
     if latest_to_early_gini_ratio is None or not (latest_to_early_gini_ratio == latest_to_early_gini_ratio):
         return True, False
@@ -33,25 +40,26 @@ def stability_pass(latest_to_early_gini_ratio: float | None, gates: Gates) -> tu
 
 
 def q1_verdict(
-    *,
-    n: float,
-    defaults: float,
-    gini_seg: float,
-    gini_ci_low: float,
-    gini_overall: float,
-    oe: float,
-    ece_val: float,
-    vintage_ratio: float | None,
-    gates: Gates,
-) -> tuple[str, list[str]]:
+    n,  # type: float
+    defaults,  # type: float
+    gini_seg,  # type: float
+    gini_ci_low,  # type: float
+    gini_overall,  # type: float
+    oe,  # type: float
+    ece_val,  # type: float
+    vintage_ratio,  # type: Optional[float]
+    gates,  # type: Gates
+    **kwargs
+):
+    # type: (...) -> Tuple[str, List[str]]
     if not has_power(n, defaults, gates):
         return "INCONCLUSIVE", ["insufficient_power"]
-    failed: list[str] = []
+    failed = []  # type: List[str]
     if not rank_order_pass(gini_seg, gini_ci_low, gini_overall, gates):
         failed.append("rank_order")
     if not calibration_pass(oe, ece_val, gates):
         failed.append("calibration")
-    stab_ok, _ = stability_pass(vintage_ratio, gates)
+    stab_ok, _unused = stability_pass(vintage_ratio, gates)
     if not stab_ok:
         failed.append("stability")
     if failed:
@@ -59,24 +67,26 @@ def q1_verdict(
     return "GOOD", []
 
 
-def is_important(volume_share: float, default_share: float, gates: Gates) -> bool:
+def is_important(volume_share, default_share, gates):
+    # type: (float, float, Gates) -> bool
     return volume_share >= gates.importance_share_floor or default_share >= gates.importance_share_floor
 
 
 def q2_action(
-    *,
-    q1: str,
-    failed_pillars: list[str],
-    important: bool,
-    shape_divergent: bool,
-    delta_gini: float | None,
-    delta_gini_ci_low: float | None,
-    brier_refit: float | None,
-    brier_pooled: float | None,
-    logloss_refit: float | None,
-    logloss_pooled: float | None,
-    gates: Gates,
-) -> tuple[str, str]:
+    q1,  # type: str
+    failed_pillars,  # type: List[str]
+    important,  # type: bool
+    shape_divergent,  # type: bool
+    delta_gini,  # type: Optional[float]
+    delta_gini_ci_low,  # type: Optional[float]
+    brier_refit,  # type: Optional[float]
+    brier_pooled,  # type: Optional[float]
+    logloss_refit,  # type: Optional[float]
+    logloss_pooled,  # type: Optional[float]
+    gates,  # type: Gates
+    **kwargs
+):
+    # type: (...) -> Tuple[str, str]
     if q1 == "INCONCLUSIVE":
         return "NONE", "insufficient_power"
     rank_ok = "rank_order" not in failed_pillars

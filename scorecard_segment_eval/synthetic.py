@@ -1,15 +1,31 @@
-from __future__ import annotations
-
 import numpy as np
 import pandas as pd
 
 from scorecard_segment_eval.schema import ScorecardColumns
 
 
-def make_synthetic_book(n: int = 12000, seed: int = 7) -> tuple[pd.DataFrame, ScorecardColumns]:
+def _rng(seed):
+    if hasattr(np.random, "default_rng"):
+        return np.random.default_rng(seed)
+    return np.random.RandomState(seed)
+
+
+def _rand_int(rng, low, high, size):
+    if hasattr(rng, "integers"):
+        return rng.integers(low, high, size=size)
+    return rng.randint(low, high, size=size)
+
+
+def _rand_uniform(rng, n):
+    if hasattr(rng, "random"):
+        return rng.random(n)
+    return rng.rand(n)
+
+
+def make_synthetic_book(n=12000, seed=7):
     """Book with four segments: good, miscalibrated, inverted (split), and tiny."""
-    rng = np.random.default_rng(seed)
-    dates = pd.to_datetime("2023-01-01") + pd.to_timedelta(rng.integers(0, 540, size=n), unit="D")
+    rng = _rng(seed)
+    dates = pd.to_datetime("2023-01-01") + pd.to_timedelta(_rand_int(rng, 0, 540, n), unit="D")
     channel = np.array(["core"] * n, dtype=object)
     n_mis = int(n * 0.18)
     n_inv = int(n * 0.22)
@@ -36,16 +52,19 @@ def make_synthetic_book(n: int = 12000, seed: int = 7) -> tuple[pd.DataFrame, Sc
     p_model = p_model.copy()
     p_model[channel == "miscal"] = np.clip(p_model[channel == "miscal"] * 2.4, 1e-4, 0.95)
 
-    obs = rng.random(n) < 0.85
+    obs = _rand_uniform(rng, n) < 0.85
     obs[y == 1] = True
-    fantomas = (p_model < 0.03) & (rng.random(n) < 0.04)
+    fantomas = (p_model < 0.03) & (_rand_uniform(rng, n) < 0.04)
 
     df = pd.DataFrame(
         {
             "app_id": np.arange(n),
+            "SKP_CREDIT_CASE": np.arange(n),
             "score_date": dates,
             "obs": obs.astype(int),
+            "TargetDefaultObs": obs.astype(int),
             "default": y.astype(int),
+            "TargetDefault": y.astype(int),
             "pd": p_model,
             "x1": x1,
             "x2": x2,
@@ -65,6 +84,47 @@ def make_synthetic_book(n: int = 12000, seed: int = 7) -> tuple[pd.DataFrame, Sc
         cols_pred_woe=["x1_woe"],
         cols_pred_used=["x1_woe", "x2", "cat"],
         col_fantomas="fantomas",
+        cols_segment=["channel"],
+    )
+    return df, cols
+
+
+def make_ar_imbalanced_book(n=8000, seed=11):
+    """Two segments with a large approval-rate gap for AR-aligned Gini tests."""
+    rng = _rng(seed)
+    dates = pd.to_datetime("2023-01-01") + pd.to_timedelta(_rand_int(rng, 0, 400, n), unit="D")
+    channel = np.array(["high_ar"] * (n // 2) + ["low_ar"] * (n - n // 2), dtype=object)
+    rng.shuffle(channel)
+    x1 = rng.normal(size=n)
+    logit = -1.8 + 1.1 * x1
+    p_true = 1 / (1 + np.exp(-logit))
+    y = rng.binomial(1, p_true)
+    p_model = p_true.copy()
+    obs = np.zeros(n, dtype=int)
+    high = channel == "high_ar"
+    # High AR: keep ~80% (best scores = lowest PD); low AR: keep ~40%
+    obs[high] = (p_model[high] <= np.quantile(p_model[high], 0.80)).astype(int)
+    obs[~high] = (p_model[~high] <= np.quantile(p_model[~high], 0.40)).astype(int)
+    obs[y == 1] = 1
+    df = pd.DataFrame(
+        {
+            "app_id": np.arange(n),
+            "score_date": dates,
+            "obs": obs,
+            "default": y.astype(int),
+            "pd": p_model,
+            "x1": x1,
+            "channel": channel,
+        }
+    )
+    cols = ScorecardColumns(
+        col_id="app_id",
+        col_date="score_date",
+        col_obs="obs",
+        col_target="default",
+        col_score="pd",
+        cols_pred=["x1"],
+        cols_pred_used=["x1"],
         cols_segment=["channel"],
     )
     return df, cols

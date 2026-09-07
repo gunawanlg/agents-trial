@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "features": {
+    "x1": {
+      "type": "numerical",
+      "bins": [-1e99, -0.8, -0.2, 0.2, 0.8, 1e99]
+    },
+    "cat": {
+      "type": "categorical",
+      "groups": {
+        "A": ["A"],
+        "B_C": ["B", "C"]
+      }
+    }
+  }
+}

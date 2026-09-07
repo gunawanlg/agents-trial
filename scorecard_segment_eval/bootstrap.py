@@ -1,27 +1,34 @@
-from __future__ import annotations
-
 import numpy as np
+
+from typing import Any, Dict
 
 from scorecard_segment_eval.metrics import gini
 
 
-def bootstrap_gini_ci(
-    y,
-    p,
-    n_bootstrap: int = 200,
-    seed: int = 42,
-    z: float = 1.64,
-) -> dict[str, float]:
+def _rng(seed):
+    if hasattr(np.random, "default_rng"):
+        return np.random.default_rng(seed)
+    return np.random.RandomState(seed)
+
+
+def _randint(rng, n, size):
+    if hasattr(rng, "integers"):
+        return rng.integers(0, n, size=size)
+    return rng.randint(0, n, size=size)
+
+
+def bootstrap_gini_ci(y, p, n_bootstrap=200, seed=42, z=1.64):
+    # type: (Any, Any, int, int, float) -> Dict[str, float]
     y = np.asarray(y, dtype=float)
     p = np.asarray(p, dtype=float)
     n = len(y)
     point = gini(y, p)
     if n < 10 or np.isnan(point):
         return {"gini": point, "gini_se": float("nan"), "gini_ci_low": float("nan")}
-    rng = np.random.default_rng(seed)
+    rng = _rng(seed)
     draws = np.empty(n_bootstrap)
     for i in range(n_bootstrap):
-        idx = rng.integers(0, n, size=n)
+        idx = _randint(rng, n, n)
         draws[i] = gini(y[idx], p[idx])
     draws = draws[np.isfinite(draws)]
     if len(draws) < 10:
@@ -30,14 +37,8 @@ def bootstrap_gini_ci(
     return {"gini": point, "gini_se": se, "gini_ci_low": point - z * se}
 
 
-def bootstrap_delta_gini(
-    y,
-    p_refit,
-    p_pooled,
-    n_bootstrap: int = 200,
-    seed: int = 42,
-    z: float = 1.64,
-) -> dict[str, float]:
+def bootstrap_delta_gini(y, p_refit, p_pooled, n_bootstrap=200, seed=42, z=1.64):
+    # type: (Any, Any, Any, int, int, float) -> Dict[str, float]
     y = np.asarray(y, dtype=float)
     p_refit = np.asarray(p_refit, dtype=float)
     p_pooled = np.asarray(p_pooled, dtype=float)
@@ -53,10 +54,10 @@ def bootstrap_delta_gini(
             "delta_gini_se": float("nan"),
             "delta_gini_ci_low": float("nan"),
         }
-    rng = np.random.default_rng(seed)
+    rng = _rng(seed)
     draws = np.empty(n_bootstrap)
     for i in range(n_bootstrap):
-        idx = rng.integers(0, n, size=n)
+        idx = _randint(rng, n, n)
         draws[i] = gini(y[idx], p_refit[idx]) - gini(y[idx], p_pooled[idx])
     draws = draws[np.isfinite(draws)]
     se = float(np.std(draws, ddof=1)) if len(draws) >= 10 else float("nan")
