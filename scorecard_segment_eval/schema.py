@@ -1,20 +1,20 @@
-from __future__ import annotations
-
 from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 
 @dataclass(frozen=True)
 class ScorecardColumns:
-    col_id: str
-    col_date: str
-    col_obs: str
-    col_target: str
-    col_score: str
-    cols_pred: list[str]
-    cols_segment: list[str]
-    col_fantomas: str | None = None
-    cols_pred_woe: list[str] = field(default_factory=list)
-    cols_pred_used: list[str] = field(default_factory=list)
+    col_id: str = "SKP_CREDIT_CASE"
+    col_date: str = "date"
+    col_obs: str = "TargetDefaultObs"
+    col_target: str = "TargetDefault"
+    col_score: str = ""
+    cols_pred: List[str] = field(default_factory=list)
+    cols_segment: List[str] = field(default_factory=list)
+    col_fantomas: Optional[str] = None
+    cols_pred_woe: List[str] = field(default_factory=list)
+    cols_pred_used: List[str] = field(default_factory=list)
+    grouping: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -36,4 +36,8 @@ class Gates:
     n_bootstrap: int = 200
     n_ece_bins: int = 10
     n_woe_bins: int = 10
+    n_psi_bins: int = 10
+    approval_rate_gap: float = 0.10
+    refit_stability_penalty: float = 0.05
+    max_woe_psi: float = 0.25
     bootstrap_seed: int = 42
