@@ -649,8 +649,10 @@ def _finalise_stats(spec, series, y_arr):
         spec.woe.setdefault(label, 0.0)
         spec.counts.setdefault(label, 0.0)
         spec.events.setdefault(label, 0.0)
-    spec.woe.setdefault(spec.missing_label, 0.0)
-    spec.woe.setdefault(OTHER_LABEL, 0.0)
+    for label in (spec.missing_label, OTHER_LABEL):
+        spec.woe.setdefault(label, 0.0)
+        spec.counts.setdefault(label, 0.0)
+        spec.events.setdefault(label, 0.0)
 
 
 # --------------------------------------------------------------------------
