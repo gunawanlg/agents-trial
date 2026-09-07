@@ -1,24 +1,40 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=40.8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "scorecard-segment-eval"
-version = "0.1.0"
+version = "0.2.0"
 description = "Sub-population evaluation for logistic scorecards: performance verdict and split vs pooled."
-requires-python = ">=3.10"
+requires-python = ">=3.6"
 dependencies = [
-  "numpy>=1.24",
-  "pandas>=2.0",
-  "scikit-learn>=1.3",
-  "scipy>=1.10",
+  # Lower bounds are the oldest releases that still ship a Python 3.6 wheel.
+  # numpy 1.17 is the first with Generator/SeedSequence, which the parallel
+  # bootstrap relies on for per-replicate seeding.
+  "numpy>=1.17",
+  "pandas>=0.25",
+  "scikit-learn>=0.22",
+  "scipy>=1.4",
+  # stdlib from 3.7 onwards; the backport is only pulled in on 3.6.
+  "dataclasses; python_version < '3.7'",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4"]
+dev = ["pytest>=3.6", "vermin>=1.5"]
+# Optional accelerators. Both are strictly optional: the package warns and
+# falls back to a pure scikit-learn path when they are absent.
+binning = ["optbinning>=0.8"]
+submodel = ["xgboost>=1.0"]
+all = ["optbinning>=0.8", "xgboost>=1.0"]
+
+[tool.setuptools]
+include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["scorecard_segment_eval*"]
+
+[tool.setuptools.package-data]
+scorecard_segment_eval = ["sql/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

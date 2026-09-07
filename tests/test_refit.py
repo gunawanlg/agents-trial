@@ -1,0 +1,191 @@
+import warnings
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from scorecard_segment_eval.binning import BinningModel
+from scorecard_segment_eval.metrics import gini
+from scorecard_segment_eval.refit import (
+    MAX_SUBMODEL_DEPTH,
+    WoEEncoder,
+    fit_submodel,
+    recalibrate_pd,
+    refit_same_predictors,
+    refit_with_diagnostics,
+    submodel_params,
+    xgboost_available,
+)
+from scorecard_segment_eval.schema import Gates
+
+
+def _split_book(n=6000, seed=17):
+    rng = np.random.default_rng(seed)
+    dates = pd.Timestamp("2022-01-01") + pd.to_timedelta(
+        rng.integers(0, 540, size=n), unit="D"
+    )
+    x1 = rng.normal(size=n)
+    x2 = rng.normal(size=n)
+    cat = rng.choice(["A", "B", "C"], size=n)
+    logit = -2.0 + 1.3 * x1 - 0.8 * x2 + np.where(cat == "B", 0.5, 0.0)
+    y = rng.binomial(1, 1.0 / (1.0 + np.exp(-logit)))
+    frame = pd.DataFrame(
+        {"date": dates, "x1": x1, "x2": x2, "cat": cat, "y": y}
+    ).sort_values("date").reset_index(drop=True)
+    cut = int(len(frame) * 0.7)
+    return frame.iloc[:cut].copy(), frame.iloc[cut:].copy()
+
+
+def test_woe_encoder_keeps_legacy_surface_and_exposes_grouping():
+    train, holdout = _split_book()
+    encoder = WoEEncoder(n_bins=8)
+    encoder.fit(train[["x1", "x2", "cat"]], train["y"])
+    assert encoder.columns_ == ["x1", "x2", "cat"]
+    assert set(encoder.woe_) == {"x1", "x2", "cat"}
+    assert encoder.edges_["cat"] is None
+    assert encoder.edges_["x1"] is not None
+    matrix = encoder.transform(holdout[["x1", "x2", "cat"]])
+    assert matrix.shape == (len(holdout), 3)
+    grouping = encoder.to_grouping()
+    assert isinstance(grouping, BinningModel)
+    rebuilt = WoEEncoder.from_grouping(grouping)
+    np.testing.assert_allclose(rebuilt.transform(holdout[["x1", "x2", "cat"]]), matrix)
+
+
+def test_woe_encoder_transform_before_fit_raises():
+    with pytest.raises(ValueError):
+        WoEEncoder().transform(pd.DataFrame({"x": [1.0]}))
+
+
+def test_refit_beats_pooled_when_signal_is_present():
+    train, holdout = _split_book()
+    p = refit_same_predictors(train, holdout, ["x1", "x2", "cat"], "y", Gates())
+    assert len(p) == len(holdout)
+    assert gini(holdout["y"].to_numpy(dtype=float), p) > 0.3
+
+
+def test_refit_with_diagnostics_returns_stability_and_coefficients():
+    train, holdout = _split_book()
+    result = refit_with_diagnostics(
+        train, holdout, ["x1", "x2", "cat"], "y", Gates(), date_col="date"
+    )
+    assert result.method == "logistic_woe"
+    assert "__intercept__" in result.coefficients
+    assert set(result.stability["feature"]) == {"x1", "x2", "cat"}
+    assert "stability_pass" in result.stability_summary
+    assert isinstance(result.stability_pass(), bool)
+    assert np.isfinite(result.stability_score()) or np.isnan(result.stability_score())
+
+
+def test_refit_reuses_a_supplied_grouping():
+    train, holdout = _split_book()
+    grouping = BinningModel.fit(train[["x1", "x2", "cat"]], train["y"], Gates())
+    result = refit_with_diagnostics(
+        train, holdout, ["x1", "x2", "cat"], "y", Gates(), grouping=grouping
+    )
+    assert result.grouping is grouping
+
+
+def test_refit_without_usable_predictors_returns_nans():
+    train, holdout = _split_book()
+    result = refit_with_diagnostics(train, holdout, ["nope"], "y", Gates())
+    assert result.method == "none"
+    assert np.isnan(result.p_holdout).all()
+    assert result.messages == ["no_usable_predictors"]
+
+
+def test_submodel_params_hard_cap_max_depth():
+    params = submodel_params(Gates(), {"max_depth": 12, "n_estimators": 10})
+    assert params["max_depth"] == MAX_SUBMODEL_DEPTH
+    assert params["n_estimators"] == 10
+    lowered = submodel_params(Gates(submodel_max_depth=2))
+    assert lowered["max_depth"] == 2
+    raised = submodel_params(Gates(submodel_max_depth=99))
+    assert raised["max_depth"] == MAX_SUBMODEL_DEPTH
+
+
+def test_submodel_params_warns_when_depth_is_clamped():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        submodel_params(Gates(), {"max_depth": 7})
+    assert any("interaction cap" in str(w.message) for w in caught)
+
+
+def test_submodel_falls_back_with_a_warning_when_xgboost_is_absent(monkeypatch):
+    """Exercised regardless of whether xgboost happens to be installed."""
+    monkeypatch.setattr("scorecard_segment_eval.refit.xgboost_available", lambda: False)
+    train, holdout = _split_book(n=3000)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = refit_with_diagnostics(
+            train, holdout, ["x1", "x2", "cat"], "y", Gates(), submodel=True, date_col="date"
+        )
+    assert result.method == "logistic_woe"
+    assert "xgboost_unavailable_fallback_logistic" in result.messages
+    assert any("xgboost" in str(w.message) for w in caught)
+    assert np.isfinite(result.p_holdout).all()
+
+
+def test_fit_submodel_returns_none_without_xgboost(monkeypatch):
+    monkeypatch.setattr("scorecard_segment_eval.refit.xgboost_available", lambda: False)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        model = fit_submodel(np.zeros((10, 2)), np.array([0, 1] * 5), Gates())
+    assert model is None
+    assert any("xgboost" in str(w.message) for w in caught)
+
+
+@pytest.mark.skipif(not xgboost_available(), reason="optional xgboost extra not installed")
+def test_submodel_uses_xgboost_and_respects_the_depth_cap():
+    train, holdout = _split_book(n=4000)
+    result = refit_with_diagnostics(
+        train,
+        holdout,
+        ["x1", "x2", "cat"],
+        "y",
+        Gates(),
+        submodel=True,
+        xgb_params={"n_estimators": 60, "max_depth": 9},
+        date_col="date",
+    )
+    assert result.method == "xgboost_submodel"
+    assert np.isfinite(result.p_holdout).all()
+    assert gini(holdout["y"].to_numpy(dtype=float), result.p_holdout) > 0.3
+    assert set(result.coefficients) == {"x1", "x2", "cat"}
+    booster = fit_submodel(
+        np.column_stack([train["x1"], train["x2"]]),
+        train["y"].to_numpy(dtype=int),
+        Gates(),
+        {"n_estimators": 10, "max_depth": 9},
+    )
+    assert int(booster.get_params()["max_depth"]) == MAX_SUBMODEL_DEPTH
+
+
+def test_recalibration_fixes_the_level_without_touching_the_ranking():
+    rng = np.random.default_rng(3)
+    n = 4000
+    p_true = rng.uniform(0.01, 0.4, size=n)
+    y = rng.binomial(1, p_true)
+    p_biased = np.clip(p_true * 2.5, 1e-4, 0.99)
+    recalibrated = recalibrate_pd(p_biased, y, p_biased)
+    assert abs(recalibrated.mean() - y.mean()) < abs(p_biased.mean() - y.mean())
+    assert gini(y, recalibrated) == pytest.approx(gini(y, p_biased), abs=1e-9)
+
+
+def test_recalibration_with_one_class_returns_input():
+    p = np.array([0.1, 0.2, 0.3])
+    out = recalibrate_pd(p, np.zeros(3, dtype=int), p)
+    np.testing.assert_allclose(out, p)
+
+
+def test_refit_is_identical_serially_and_in_parallel():
+    train, holdout = _split_book()
+    serial = refit_with_diagnostics(
+        train, holdout, ["x1", "x2", "cat"], "y", Gates(), date_col="date", n_jobs=1
+    )
+    parallel = refit_with_diagnostics(
+        train, holdout, ["x1", "x2", "cat"], "y", Gates(), date_col="date", n_jobs=-1
+    )
+    np.testing.assert_array_equal(serial.p_holdout, parallel.p_holdout)
+    assert serial.stability.equals(parallel.stability)
+    assert serial.stability_summary == parallel.stability_summary
