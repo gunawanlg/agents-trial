@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import numpy as np
 
 from scorecard_segment_eval.metrics import gini
@@ -8,10 +6,10 @@ from scorecard_segment_eval.metrics import gini
 def bootstrap_gini_ci(
     y,
     p,
-    n_bootstrap: int = 200,
-    seed: int = 42,
-    z: float = 1.64,
-) -> dict[str, float]:
+    n_bootstrap=200,
+    seed=42,
+    z=1.64,
+):
     y = np.asarray(y, dtype=float)
     p = np.asarray(p, dtype=float)
     n = len(y)
@@ -34,10 +32,10 @@ def bootstrap_delta_gini(
     y,
     p_refit,
     p_pooled,
-    n_bootstrap: int = 200,
-    seed: int = 42,
-    z: float = 1.64,
-) -> dict[str, float]:
+    n_bootstrap=200,
+    seed=42,
+    z=1.64,
+):
     y = np.asarray(y, dtype=float)
     p_refit = np.asarray(p_refit, dtype=float)
     p_pooled = np.asarray(p_pooled, dtype=float)

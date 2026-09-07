@@ -1,13 +1,11 @@
-from __future__ import annotations
-
 from scorecard_segment_eval.schema import Gates
 
 
-def has_power(n: float, defaults: float, gates: Gates) -> bool:
+def has_power(n, defaults, gates):
     return n >= gates.min_n and defaults >= gates.min_events
 
 
-def rank_order_pass(gini_seg: float, gini_ci_low: float, gini_overall: float, gates: Gates) -> bool:
+def rank_order_pass(gini_seg, gini_ci_low, gini_overall, gates):
     if not (gini_seg == gini_seg):  # NaN
         return False
     ratio = gini_seg / gini_overall if gini_overall and gini_overall == gini_overall and gini_overall != 0 else float("nan")
@@ -17,13 +15,13 @@ def rank_order_pass(gini_seg: float, gini_ci_low: float, gini_overall: float, ga
     return absolute_ok and (relative_ok or ci_clears_floor)
 
 
-def calibration_pass(oe: float, ece_val: float, gates: Gates) -> bool:
+def calibration_pass(oe, ece_val, gates):
     if not (oe == oe) or not (ece_val == ece_val):
         return False
     return gates.oe_lo <= oe <= gates.oe_hi and ece_val <= gates.ece_max
 
 
-def stability_pass(latest_to_early_gini_ratio: float | None, gates: Gates) -> tuple[bool, bool]:
+def stability_pass(latest_to_early_gini_ratio, gates):
     """Returns (pass, is_warn_only). Fail only on a severe configured drop."""
     if latest_to_early_gini_ratio is None or not (latest_to_early_gini_ratio == latest_to_early_gini_ratio):
         return True, False
@@ -32,21 +30,10 @@ def stability_pass(latest_to_early_gini_ratio: float | None, gates: Gates) -> tu
     return True, False
 
 
-def q1_verdict(
-    *,
-    n: float,
-    defaults: float,
-    gini_seg: float,
-    gini_ci_low: float,
-    gini_overall: float,
-    oe: float,
-    ece_val: float,
-    vintage_ratio: float | None,
-    gates: Gates,
-) -> tuple[str, list[str]]:
+def q1_verdict(*, n, defaults, gini_seg, gini_ci_low, gini_overall, oe, ece_val, vintage_ratio, gates):
     if not has_power(n, defaults, gates):
         return "INCONCLUSIVE", ["insufficient_power"]
-    failed: list[str] = []
+    failed = []
     if not rank_order_pass(gini_seg, gini_ci_low, gini_overall, gates):
         failed.append("rank_order")
     if not calibration_pass(oe, ece_val, gates):
@@ -59,24 +46,24 @@ def q1_verdict(
     return "GOOD", []
 
 
-def is_important(volume_share: float, default_share: float, gates: Gates) -> bool:
+def is_important(volume_share, default_share, gates):
     return volume_share >= gates.importance_share_floor or default_share >= gates.importance_share_floor
 
 
 def q2_action(
     *,
-    q1: str,
-    failed_pillars: list[str],
-    important: bool,
-    shape_divergent: bool,
-    delta_gini: float | None,
-    delta_gini_ci_low: float | None,
-    brier_refit: float | None,
-    brier_pooled: float | None,
-    logloss_refit: float | None,
-    logloss_pooled: float | None,
-    gates: Gates,
-) -> tuple[str, str]:
+    q1,
+    failed_pillars,
+    important,
+    shape_divergent,
+    delta_gini,
+    delta_gini_ci_low,
+    brier_refit,
+    brier_pooled,
+    logloss_refit,
+    logloss_pooled,
+    gates
+):
     if q1 == "INCONCLUSIVE":
         return "NONE", "insufficient_power"
     rank_ok = "rank_order" not in failed_pillars

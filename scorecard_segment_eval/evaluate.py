@@ -1,6 +1,5 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -23,7 +22,7 @@ class SegmentEvalResult:
     vintage: pd.DataFrame
 
 
-def _vintage_ratio(obs: pd.DataFrame, cols: ScorecardColumns) -> tuple[float | None, pd.DataFrame]:
+def _vintage_ratio(obs, cols):
     if obs.empty:
         return None, pd.DataFrame()
     dates = pd.to_datetime(obs[cols.col_date], errors="coerce")
@@ -44,7 +43,7 @@ def _vintage_ratio(obs: pd.DataFrame, cols: ScorecardColumns) -> tuple[float | N
     return float(latest / early), table
 
 
-def _slice_metrics(part: pd.DataFrame, cols: ScorecardColumns, gates: Gates) -> dict[str, float]:
+def _slice_metrics(part, cols, gates):
     bundle = performance_bundle(part[cols.col_target], part[cols.col_score], n_ece_bins=gates.n_ece_bins)
     ci = bootstrap_gini_ci(
         part[cols.col_target],
@@ -58,13 +57,7 @@ def _slice_metrics(part: pd.DataFrame, cols: ScorecardColumns, gates: Gates) -> 
     return bundle
 
 
-def _run_holdout_models(
-    obs_seg: pd.DataFrame,
-    cols: ScorecardColumns,
-    gates: Gates,
-    do_refit: bool,
-    do_recal: bool,
-) -> dict[str, float | None]:
+def _run_holdout_models(obs_seg, cols, gates, do_refit, do_recal, **kwargs):
     empty = {
         "n_holdout": None,
         "defaults_holdout": None,
@@ -103,7 +96,16 @@ def _run_holdout_models(
     if do_refit and cols.cols_pred:
         missing = [c for c in cols.cols_pred if c not in obs_seg.columns]
         if not missing:
-            p_refit = refit_same_predictors(train, holdout, cols.cols_pred, cols.col_target, gates)
+            p_refit, details = refit_same_predictors(
+                train,
+                holdout,
+                cols.cols_pred,
+                cols.col_target,
+                gates,
+                date_col=cols.col_date,
+                return_details=True,
+                **kwargs
+            )
             delta = bootstrap_delta_gini(
                 y,
                 p_refit,
@@ -115,10 +117,51 @@ def _run_holdout_models(
             empty.update(delta)
             empty["brier_refit"] = brier(y, p_refit)
             empty["logloss_refit"] = logloss(y, p_refit)
+            empty["refit_mean_predictor_psi"] = details["mean_selected_psi"]
+            empty["refit_selected_predictors"] = ",".join(details["selected_predictors"])
+            empty["refit_selection_objective"] = details["selection_objective"]
     return empty
 
 
-def evaluate_segments(df: pd.DataFrame, cols: ScorecardColumns, gates: Gates | None = None) -> SegmentEvalResult:
+def _similar_approval_rate_analysis(part, portfolio, cols, gates):
+    approval_seg = float(part[cols.col_obs].fillna(0).astype(float).mean())
+    approval_all = float(portfolio[cols.col_obs].fillna(0).astype(float).mean())
+    gap = abs(approval_seg - approval_all)
+    output = {
+        "approval_rate": approval_seg,
+        "approval_rate_overall": approval_all,
+        "approval_rate_gap": gap,
+        "gini_similar_ar": float("nan"),
+        "gini_overall_similar_ar": float("nan"),
+        "similar_ar_analysis": "not_required",
+    }
+    if gap < gates.approval_rate_gap:
+        return output
+    common_ar = min(approval_seg, approval_all)
+    ginis = []
+    counts = []
+    for frame in (part, portfolio):
+        score = pd.to_numeric(frame[cols.col_score], errors="coerce")
+        threshold = score.quantile(common_ar)
+        simulated = frame.loc[score <= threshold]
+        simulated = simulated.loc[observable_mask(simulated, cols)]
+        ginis.append(gini(simulated[cols.col_target], simulated[cols.col_score]))
+        counts.append(len(simulated))
+    output.update(
+        {
+            "gini_similar_ar": ginis[0],
+            "gini_overall_similar_ar": ginis[1],
+            "similar_ar_analysis": "simulated_at_lower_ar=%.4f;n_segment=%d;n_overall=%d" % (
+                common_ar,
+                counts[0],
+                counts[1],
+            ),
+        }
+    )
+    return output
+
+
+def evaluate_segments(df, cols, gates=None, **kwargs):
     gates = gates or Gates()
     obs_all = df.loc[observable_mask(df, cols)].copy()
     fan_all = fantomas_mask(df, cols)
@@ -127,11 +170,11 @@ def evaluate_segments(df: pd.DataFrame, cols: ScorecardColumns, gates: Gates | N
     n_all = len(df)
     defaults_all = float(obs_all[cols.col_target].sum()) if len(obs_all) else 0.0
 
-    summary_rows: list[dict] = []
-    decision_rows: list[dict] = []
-    refit_rows: list[dict] = []
-    char_rows: list[pd.DataFrame] = []
-    vintage_rows: list[pd.DataFrame] = []
+    summary_rows = []
+    decision_rows = []
+    refit_rows = []
+    char_rows = []
+    vintage_rows = []
 
     overall_row = {
         "segment_col": "__overall__",
@@ -158,6 +201,7 @@ def evaluate_segments(df: pd.DataFrame, cols: ScorecardColumns, gates: Gates | N
             defaults = float(obs[cols.col_target].sum()) if len(obs) else 0.0
             default_share = defaults / defaults_all if defaults_all else 0.0
             important = is_important(volume_share, default_share, gates)
+            similar_ar = _similar_approval_rate_analysis(part, df, cols, gates)
 
             m_obs = _slice_metrics(obs, cols, gates) if len(obs) else performance_bundle([], [])
             if len(obs) == 0:
@@ -177,6 +221,7 @@ def evaluate_segments(df: pd.DataFrame, cols: ScorecardColumns, gates: Gates | N
                     "default_share": default_share,
                     "fantomas_rate": float(fan.mean()) if n_ttd else float("nan"),
                     "important": important,
+                    **similar_ar,
                     **m_obs,
                 }
             )
@@ -216,7 +261,14 @@ def evaluate_segments(df: pd.DataFrame, cols: ScorecardColumns, gates: Gates | N
 
             do_recal = q1 == "WEAK" and "rank_order" not in failed and "calibration" in failed
             do_refit = (q1 == "WEAK" and "rank_order" in failed) or divergent
-            hold = _run_holdout_models(obs, cols, gates, do_refit=do_refit, do_recal=do_recal or do_refit)
+            hold = _run_holdout_models(
+                obs,
+                cols,
+                gates,
+                do_refit=do_refit,
+                do_recal=do_recal or do_refit,
+                **kwargs
+            )
             hold.update(
                 {
                     "segment_col": seg_col,
@@ -259,6 +311,7 @@ def evaluate_segments(df: pd.DataFrame, cols: ScorecardColumns, gates: Gates | N
                     "oe": m_obs.get("oe"),
                     "ece": m_obs.get("ece"),
                     "vintage_gini_ratio": ratio,
+                    **similar_ar,
                 }
             )
 

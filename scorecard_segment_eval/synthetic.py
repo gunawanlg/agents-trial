@@ -1,12 +1,10 @@
-from __future__ import annotations
-
 import numpy as np
 import pandas as pd
 
 from scorecard_segment_eval.schema import ScorecardColumns
 
 
-def make_synthetic_book(n: int = 12000, seed: int = 7) -> tuple[pd.DataFrame, ScorecardColumns]:
+def make_synthetic_book(n=12000, seed=7):
     """Book with four segments: good, miscalibrated, inverted (split), and tiny."""
     rng = np.random.default_rng(seed)
     dates = pd.to_datetime("2023-01-01") + pd.to_timedelta(rng.integers(0, 540, size=n), unit="D")
