@@ -119,7 +119,7 @@ def fit_segment_lr(X_woe, y):
 
 def _predictor_stability(encoded, dates, n_bins=10):
     """Worst vintage-to-portfolio PSI for each encoded predictor."""
-    periods = pd.to_datetime(dates, errors="coerce").dt.to_period("M")
+    periods = pd.to_datetime(dates, errors="coerce").dt.to_period("M").reset_index(drop=True)
     output = []
     for idx in range(encoded.shape[1]):
         values = pd.Series(encoded[:, idx])
@@ -131,7 +131,7 @@ def _predictor_stability(encoded, dates, n_bins=10):
         all_share = pd.cut(values, edges).value_counts(normalize=True)
         worst = 0.0
         for period in periods.dropna().unique():
-            local = pd.cut(values[periods == period], edges).value_counts(normalize=True)
+            local = pd.cut(values[(periods == period).to_numpy()], edges).value_counts(normalize=True)
             aligned = pd.concat([local.rename("local"), all_share.rename("all")], axis=1).fillna(1e-6).clip(lower=1e-6)
             worst = max(worst, float(((aligned.local - aligned["all"]) * np.log(aligned.local / aligned["all"])).sum()))
         output.append(worst)
