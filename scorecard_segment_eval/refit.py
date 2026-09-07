@@ -155,32 +155,46 @@ def refit_same_predictors(train, holdout, pred_cols, target_col, gates, **kwargs
         stable_idx = np.arange(len(pred_cols))
 
     submodel = bool(kwargs.get("submodel", False))
+    XGBClassifier = None
     if submodel:
         try:
             from xgboost import XGBClassifier
         except ImportError:
             raise ImportError("submodel=True requires the optional 'xgboost' package")
-        model = XGBClassifier(
-            max_depth=min(int(kwargs.get("max_depth", 3)), 3),
-            n_estimators=int(kwargs.get("n_estimators", 100)),
-            learning_rate=float(kwargs.get("learning_rate", 0.05)),
-            random_state=int(kwargs.get("random_state", 17)),
-            eval_metric="logloss",
-        )
-    else:
-        model = fit_segment_lr(x_tr[:, stable_idx], y_tr)
-    if submodel:
-        model.fit(x_tr[:, stable_idx], y_tr)
-    predictions = model.predict_proba(x_ho[:, stable_idx])[:, 1]
-    holdout_gini = float("nan")
-    if target_col in holdout and holdout[target_col].nunique() > 1:
-        holdout_gini = 2.0 * roc_auc_score(holdout[target_col], predictions) - 1.0
+
+    all_idx = np.arange(len(pred_cols))
+    candidates = [all_idx]
+    if not np.array_equal(all_idx, stable_idx):
+        candidates.append(stable_idx)
+    candidate_results = []
+    for candidate_idx in candidates:
+        if submodel:
+            model = XGBClassifier(
+                max_depth=min(int(kwargs.get("max_depth", 3)), 3),
+                n_estimators=int(kwargs.get("n_estimators", 100)),
+                learning_rate=float(kwargs.get("learning_rate", 0.05)),
+                random_state=int(kwargs.get("random_state", 17)),
+                eval_metric="logloss",
+            )
+            model.fit(x_tr[:, candidate_idx], y_tr)
+        else:
+            model = fit_segment_lr(x_tr[:, candidate_idx], y_tr)
+        candidate_predictions = model.predict_proba(x_ho[:, candidate_idx])[:, 1]
+        candidate_gini = float("nan")
+        if target_col in holdout and holdout[target_col].nunique() > 1:
+            candidate_gini = 2.0 * roc_auc_score(holdout[target_col], candidate_predictions) - 1.0
+        mean_psi = float(stability[candidate_idx].mean())
+        objective = candidate_gini - gates.refit_stability_penalty * mean_psi
+        candidate_results.append((objective, candidate_gini, mean_psi, candidate_idx, candidate_predictions))
+    chosen = max(candidate_results, key=lambda item: item[0] if np.isfinite(item[0]) else -np.inf)
+    objective, holdout_gini, mean_psi, stable_idx, predictions = chosen
     details = {
         "predictor_stability": dict(zip(pred_cols, stability)),
         "selected_predictors": [pred_cols[i] for i in stable_idx],
-        "mean_selected_psi": float(stability[stable_idx].mean()),
+        "mean_selected_psi": mean_psi,
         "holdout_gini": holdout_gini,
-        "selection_objective": holdout_gini - gates.refit_stability_penalty * float(stability[stable_idx].mean()),
+        "selection_objective": objective,
+        "candidate_objectives": [item[0] for item in candidate_results],
         "submodel": submodel,
         "grouping": dict((col, {"edges": enc.edges_[col], "categories": enc.category_groups_[col]}) for col in pred_cols),
     }
