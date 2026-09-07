@@ -80,6 +80,7 @@ def test_tree_woe_refit_reports_vintage_stability():
     assert set(details["predictor_stability"]) == {"x", "cat"}
     assert details["selection_objective"] == details["selection_objective"]
     assert len(details["grouping"]["x"]["edges"]) <= 6
+    json.dumps(details["grouping"])
 
 
 def test_characteristic_psi_uses_grouping_and_portfolio_deciles():

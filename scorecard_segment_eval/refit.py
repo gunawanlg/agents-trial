@@ -196,7 +196,20 @@ def refit_same_predictors(train, holdout, pred_cols, target_col, gates, **kwargs
         "selection_objective": objective,
         "candidate_objectives": [item[0] for item in candidate_results],
         "submodel": submodel,
-        "grouping": dict((col, {"edges": enc.edges_[col], "categories": enc.category_groups_[col]}) for col in pred_cols),
+        "grouping": dict(
+            (
+                col,
+                {
+                    "edges": (
+                        [float(value) for value in enc.edges_[col] if np.isfinite(value)]
+                        if enc.edges_[col] is not None
+                        else None
+                    ),
+                    "categories": enc.category_groups_[col],
+                },
+            )
+            for col in pred_cols
+        ),
     }
     return (predictions, details) if kwargs.get("return_details", False) else predictions
 
