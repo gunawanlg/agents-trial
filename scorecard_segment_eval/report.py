@@ -10,6 +10,20 @@ from scorecard_segment_eval.compat import ensure_dir
 from scorecard_segment_eval.evaluate import SegmentEvalResult
 
 
+def _utc_stamp():
+    try:
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _frame_to_markdown(frame):
+    try:
+        return frame.to_markdown(index=False)
+    except Exception:
+        return frame.to_string(index=False)
+
+
 def decision_table(result):
     # type: (SegmentEvalResult) -> pd.DataFrame
     cols = [
@@ -189,7 +203,7 @@ def build_markdown_report(result, title="Segment scorecard evaluation"):
     lines = [
         "# " + title,
         "",
-        "Generated %s." % datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+        "Generated %s." % _utc_stamp(),
         "",
         "## Snapshot",
         "",
@@ -205,7 +219,7 @@ def build_markdown_report(result, title="Segment scorecard evaluation"):
         lines.append("_No segment decisions._")
     else:
         show = table.copy()
-        lines.append(show.to_markdown(index=False) if hasattr(show, "to_markdown") else show.to_string(index=False))
+        lines.append(_frame_to_markdown(show))
     lines.extend(["", "## Recommendations", ""])
     if result.decisions.empty:
         lines.append("_None._")
@@ -337,7 +351,7 @@ def build_html_report(result, title="Segment scorecard evaluation"):
                 )
             )
 
-    generated = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    generated = _utc_stamp()
     html = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -436,8 +450,11 @@ def write_final_report(result, path, title="Segment scorecard evaluation", also_
     if also_markdown:
         root, _ext = os.path.splitext(path)
         md_path = root + ".md"
-        with open(md_path, "w") as handle:
-            handle.write(build_markdown_report(result, title=title))
+        try:
+            with open(md_path, "w") as handle:
+                handle.write(build_markdown_report(result, title=title))
+        except (IOError, OSError):
+            md_path = None
     return path, md_path
 
 

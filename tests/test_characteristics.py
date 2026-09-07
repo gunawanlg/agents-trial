@@ -58,6 +58,24 @@ def test_woe_feature_uses_existing_bins():
     assert table.set_index("feature").loc["woe_x", "psi_method"] == "categorical"
 
 
+def test_continuous_woe_values_use_deciles():
+    rng = np.random.RandomState(4)
+    all_df = pd.DataFrame({"y": rng.binomial(1, 0.3, 600), "x1_woe": rng.normal(size=600)})
+    seg = all_df.iloc[:200]
+    cols = ScorecardColumns(
+        col_id="id",
+        col_date="d",
+        col_obs="o",
+        col_target="y",
+        col_score="s",
+        cols_pred=[],
+        cols_pred_woe=["x1_woe"],
+        cols_segment=["g"],
+    )
+    table = feature_diagnostics(seg, all_df, cols, Gates(), grouping={})
+    assert table.set_index("feature").loc["x1_woe", "psi_method"] == "decile"
+
+
 def test_grouping_json_bins_drive_psi(tmp_path):
     all_df = _mini(500, 3)
     seg = all_df.iloc[:150].copy()

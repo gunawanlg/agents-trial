@@ -78,8 +78,13 @@ def test_stability_constrained_refit_drops_unstable():
     dates = pd.to_datetime("2023-01-01") + pd.to_timedelta(rng.randint(0, 400, size=n), unit="D")
     y = rng.binomial(1, 0.25, size=n)
     x_good = y + rng.normal(scale=0.4, size=n)
-    x_bad = rng.normal(size=n)
-    x_bad = np.where(dates > dates.median(), -y + rng.normal(scale=0.4, size=n), y + rng.normal(scale=0.4, size=n))
+    date_s = pd.Series(dates)
+    mid = date_s.quantile(0.5)
+    x_bad = np.where(
+        date_s > mid,
+        -y + rng.normal(scale=0.4, size=n),
+        y + rng.normal(scale=0.4, size=n),
+    )
     df = pd.DataFrame({"y": y, "x_good": x_good, "x_bad": x_bad, "dt": dates, "pd": np.clip(0.1 + 0.3 * y, 0.01, 0.99)})
     df = df.sort_values("dt")
     cut = df["dt"].quantile(0.7)

@@ -78,9 +78,12 @@ def _feature_bins(s_all, s_seg, feat, cols, gates, grouping):
         return apply_grouping(s_all, spec), apply_grouping(s_seg, spec), "grouping"
 
     woe_cols = list(cols.cols_pred_woe or [])
-    is_woe = feat in woe_cols or looks_like_woe_feature(feat)
-    numeric = is_numeric_series(s_all) and not is_woe
-    if not numeric:
+    named_woe = feat in woe_cols or looks_like_woe_feature(feat)
+    nuniq = int(s_all.nunique(dropna=True))
+    # Discrete WoE/category bins: non-numeric, or numeric with few levels.
+    # Continuous WoE *values* (many unique floats) still use portfolio deciles.
+    discrete = (not is_numeric_series(s_all)) or (named_woe and nuniq <= max(30, int(getattr(gates, "n_psi_deciles", 10) or 10) * 3))
+    if discrete:
         return as_str_keys(s_all), as_str_keys(s_seg), "categorical"
 
     n_decile = int(getattr(gates, "n_psi_deciles", 10) or 10)
