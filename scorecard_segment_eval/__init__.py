@@ -4,8 +4,8 @@ Q1: is the pooled score good on each business segment?
 Q2: is a same-predictor refit worth a split, or is recalibration enough?
 
 The package is written to run on Python 3.6 and up: annotations use
-``typing`` generics in comment form, and ``dataclasses`` comes from the
-backport on 3.6 (see the ``py36`` extra).
+``typing`` generics in comment form, and on 3.6 ``dataclasses`` is pulled in
+from the backport by a conditional install requirement.
 """
 
 from scorecard_segment_eval.binning import (
