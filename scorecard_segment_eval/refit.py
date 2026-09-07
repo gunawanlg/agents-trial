@@ -154,12 +154,12 @@ def submodel_params(gates=None, overrides=None):
     # type: (Optional[Gates], Optional[Dict[str, Any]]) -> Dict[str, Any]
     """Sub-model hyper-parameters with ``max_depth`` clamped to <= 3."""
     gates = gates or Gates()
+    overrides = dict(overrides or {})
     params = dict(DEFAULT_XGB_PARAMS)
-    params.update(overrides or {})
-    cap = min(int(gates.submodel_max_depth), MAX_SUBMODEL_DEPTH)
-    cap = max(cap, 1)
+    params.update(overrides)
+    cap = max(min(int(gates.submodel_max_depth), MAX_SUBMODEL_DEPTH), 1)
     requested = int(params.get("max_depth", cap))
-    if requested > cap:
+    if requested > cap and "max_depth" in overrides:
         warnings.warn(
             "sub-model max_depth=%d exceeds the %d-way interaction cap; clamping to %d"
             % (requested, cap, cap)
