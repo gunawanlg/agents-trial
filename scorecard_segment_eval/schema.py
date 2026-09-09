@@ -428,6 +428,9 @@ class Gates:
     stability_min_vintages: int = 3
     stability_max_weak_vintage_share: float = 0.34
     stability_min_reference_gini: float = 0.05
+    #: Merge adjacent bins whose vintage event-rate CIs overlap, and flag
+    #: remaining overlaps as ``overlapping_event_rate_bounds``.
+    stability_merge_overlapping_rates: bool = True
     refit_requires_stability: bool = True
 
     # --- A2: matched approval-rate Gini -------------------------------------

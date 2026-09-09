@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 
+from scorecard_segment_eval.binning import BinningModel
 from scorecard_segment_eval.schema import Gates
 from scorecard_segment_eval.stability import (
     gini_standard_error,
@@ -142,3 +143,15 @@ def test_stability_is_identical_serially_and_in_parallel():
     serial = predictor_stability(book, ["x", "x2"], "y", "date", Gates(), n_jobs=1)
     parallel = predictor_stability(book, ["x", "x2"], "y", "date", Gates(), n_jobs=-1)
     assert serial.equals(parallel)
+
+
+def test_overlapping_event_rate_bounds_are_flagged():
+    book = _monthly_book(n_months=12, n_per=80, seed=11)
+    grouping = BinningModel.fit(book[["x"]], book["y"], Gates())
+    assert grouping.overlapping_event_rate_pairs(book, book["y"], "date", "x")
+    table = predictor_stability(
+        book, ["x"], "y", "date", Gates(), grouping=grouping
+    )
+    row = table.set_index("feature").loc["x"]
+    assert "overlapping_event_rate_bounds" in str(row["stability_flags"])
+    assert not bool(row["stable"])

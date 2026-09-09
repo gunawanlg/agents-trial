@@ -218,13 +218,19 @@ characteristics table records which path each feature took.
 `grouping.vintage_stability_table(...)` is the long frame of per-bin true
 event rate, share and univariate Gini over vintages.
 `grouping.plot_vintage_stability(...)` draws those as three stacked subplots
-(requires `matplotlib`).
+(requires `matplotlib`). Adjacent bins whose vintage event-rate Wilson
+intervals overlap are merged (`merge_overlapping_event_rate_bounds`);
+remaining overlaps are flagged as `overlapping_event_rate_bounds` on the
+stability table.
 
 A supplied grouping is also the **portfolio baseline**. A refit fits new
 segment WoE bins for ordinary predictors, but keeps SQL `_VAL` / `_LIN`
-predictors in logit form. `compare_groupings` then notes per-bin edge shifts,
-merges and splits, WoE shifts and sign flips against that baseline (or against
-the grouping reconstructed from `cols_pred_woe`). The table is
+predictors in logit form. When the grouping itself comes from parsed
+scorecard SQL, the segment copy is cloned, its per-bin stats are refreshed on
+the training rows, and `compare_groupings` still runs against the original SQL
+definition (including mixed CASE features, which are compared on their numeric
+edges). `compare_groupings` then notes per-bin edge shifts, merges and
+splits, WoE shifts and sign flips. The table is
 `result.grouping_comparison`; significant notes are copied onto the segment
 `BinSpec` so the saved grouping carries the commentary.
 

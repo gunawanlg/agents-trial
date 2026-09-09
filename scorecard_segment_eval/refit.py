@@ -568,7 +568,12 @@ def refit_with_diagnostics(
 
     Predictors listed in ``logit_cols`` (typically SQL ``_VAL`` / ``_LIN``
     columns) stay in logit form ``log(p/(1-p))`` instead of being re-binned as
-    WoE.  A supplied ``grouping`` is never rewritten.
+    WoE.  A supplied ``grouping`` (including one parsed from scorecard SQL) is
+    the starting definition: per-bin stats are refreshed on the training rows
+    and compared against the portfolio / original SQL grouping.  Adjacent
+    bins whose vintage event-rate bounds overlap are merged.  When the
+    supplied object is also the portfolio grouping it is cloned first so the
+    SQL definition is not mutated.
     """
     gates = gates or Gates()
     pred_cols = [c for c in pred_cols if c in train.columns and c in holdout.columns]
@@ -598,6 +603,30 @@ def refit_with_diagnostics(
             portfolio_grouping,
             messages,
         )
+    else:
+        if portfolio_grouping is None:
+            portfolio_grouping = grouping
+            messages.append("portfolio_grouping_from_supplied_grouping")
+        if grouping is portfolio_grouping:
+            grouping = grouping.clone()
+            messages.append("segment_grouping_cloned_from_supplied")
+        grouping.refresh_stats(train, train[target_col])
+        messages.append("grouping_stats_refreshed_on_train")
+    if date_col is not None and date_col in train.columns:
+        before_bins = dict(
+            (col, len(grouping.specs[col].labels))
+            for col in grouping.columns
+            if col in grouping.specs
+        )
+        grouping.merge_overlapping_event_rate_bounds(
+            train, train[target_col], date_col, gates=gates
+        )
+        for col, n_before in before_bins.items():
+            n_after = len(grouping.specs[col].labels)
+            if n_after < n_before:
+                messages.append(
+                    "merged_overlapping_event_rate_bounds:%s:%d->%d" % (col, n_before, n_after)
+                )
     x_train = grouping.transform(train[pred_cols])
     x_holdout = grouping.transform(holdout[pred_cols])
 

@@ -234,3 +234,27 @@ def test_plot_vintage_stability_three_subplots():
     assert axes[0].get_ylabel() == "event rate"
     assert axes[1].get_ylabel() == "share"
     assert axes[2].get_ylabel() == "univariate Gini"
+
+
+def test_overlapping_event_rate_bounds_are_merged():
+    rng = np.random.default_rng(12)
+    n = 5000
+    frame = pd.DataFrame(
+        {
+            "x": rng.normal(size=n),
+            "y": rng.binomial(1, 0.12, size=n),
+            "date": pd.Timestamp("2023-01-01")
+            + pd.to_timedelta(rng.integers(0, 360, size=n), unit="D"),
+        }
+    )
+    gates = Gates(binning_max_bins=8, binning_min_bin_frac=0.08)
+    model = BinningModel.fit(frame[["x"]], frame["y"], gates)
+    n_before = len(model.specs["x"].labels)
+    assert n_before >= 3
+    model.merge_overlapping_event_rate_bounds(frame, frame["y"], "date", gates=gates)
+    n_after = len(model.specs["x"].labels)
+    assert n_after < n_before
+    assert "merged_overlapping_event_rate_bounds" in model.specs["x"].notes
+    leftover = model.overlapping_event_rate_pairs(frame, frame["y"], "date", "x")
+    # Two bins may still overlap; more than that should have been collapsed.
+    assert len(leftover) <= 1

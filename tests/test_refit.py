@@ -86,7 +86,14 @@ def test_refit_reuses_a_supplied_grouping():
     result = refit_with_diagnostics(
         train, holdout, ["x1", "x2", "cat"], "y", Gates(), grouping=grouping
     )
-    assert result.grouping is grouping
+    # A clone is used when the supplied object is also the portfolio baseline
+    # so comparison can refresh stats without mutating the original.
+    assert set(result.grouping.columns) == set(grouping.columns)
+    for col in grouping.columns:
+        assert result.grouping.specs[col].kind == grouping.specs[col].kind
+    assert result.grouping is not grouping
+    assert "segment_grouping_cloned_from_supplied" in result.messages
+    assert not result.grouping_comparison.empty
 
 
 def test_refit_without_usable_predictors_returns_nans():
@@ -307,4 +314,42 @@ def test_refit_keeps_logit_form_and_woe_bins_the_rest():
     )
     assert only_logit.method == "logistic_logit"
     assert only_logit.grouping.specs["feat_pd"].kind == "logit"
+
+
+def test_supplied_sql_grouping_still_produces_a_comparison():
+    import os
+
+    from scorecard_segment_eval.sql_model import parse_scorecard_sql_path
+
+    fixture = os.path.join(os.path.dirname(__file__), "fixtures", "sample_scorecard.sql")
+    parsed = parse_scorecard_sql_path(fixture)
+    rng = np.random.default_rng(8)
+    n = 3000
+    dates = pd.Timestamp("2023-01-01") + pd.to_timedelta(rng.integers(0, 400, size=n), unit="D")
+    indosat = rng.uniform(0.0, 0.12, size=n)
+    feat_e = np.clip(1.0 / (1.0 + np.exp(-rng.normal(size=n))), 0.02, 0.8)
+    y = rng.binomial(1, 0.5 * feat_e + 0.05, size=n)
+    frame = pd.DataFrame(
+        {"date": dates, "indosat_v2": indosat, "featE": feat_e, "y": y}
+    ).sort_values("date").reset_index(drop=True)
+    cut = int(len(frame) * 0.7)
+    train, holdout = frame.iloc[:cut].copy(), frame.iloc[cut:].copy()
+    original_notes = list(parsed.grouping.specs["indosat_v2"].notes)
+    result = refit_with_diagnostics(
+        train,
+        holdout,
+        ["indosat_v2", "featE"],
+        "y",
+        Gates(),
+        date_col="date",
+        grouping=parsed.grouping,
+        portfolio_grouping=parsed.grouping,
+        logit_cols=["featE"],
+    )
+    assert result.grouping is not parsed.grouping
+    assert parsed.grouping.specs["indosat_v2"].notes == original_notes
+    assert not result.grouping_comparison.empty
+    assert set(result.grouping_comparison["feature"]) >= {"indosat_v2", "featE"}
+    assert result.grouping.specs["featE"].kind == "logit"
+    assert np.isfinite(result.p_holdout).all()
 
