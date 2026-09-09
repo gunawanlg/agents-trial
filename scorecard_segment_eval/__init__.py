@@ -14,6 +14,7 @@ from scorecard_segment_eval.binning import (
     compare_groupings,
     fit_bin_spec,
     grouping_from_woe_columns,
+    grouping_from_dict,
     load_grouping,
     save_grouping,
 )
@@ -54,6 +55,11 @@ from scorecard_segment_eval.report import (
     save_report,
 )
 from scorecard_segment_eval.schema import Gates, ScorecardColumns, map_pred_to_woe
+from scorecard_segment_eval.sql_model import (
+    ScorecardSQLModel,
+    parse_scorecard_sql,
+    parse_scorecard_sql_path,
+)
 from scorecard_segment_eval.smartdata import (
     CapabilityReport,
     ConfirmationResult,
@@ -79,6 +85,9 @@ __all__ = [
     "Gates",
     "ScorecardColumns",
     "map_pred_to_woe",
+    "ScorecardSQLModel",
+    "parse_scorecard_sql",
+    "parse_scorecard_sql_path",
     # evaluation
     "SegmentEvalResult",
     "evaluate_segments",
@@ -93,6 +102,7 @@ __all__ = [
     "load_grouping",
     "save_grouping",
     "compare_groupings",
+    "grouping_from_dict",
     "grouping_from_woe_columns",
     # characteristics / PSI
     "feature_diagnostics",

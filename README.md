@@ -42,9 +42,12 @@ cols = ScorecardColumns(
     col_target="TargetA",
     col_obs="TargetAObs",
     cols_pred=["x1", "x2", "cat"],
+    cols_pred_woe=["x1_woe"],
     cols_segment=["CHANNEL"],
 )
-result = evaluate_segments(df, cols, Gates(n_jobs=4))
+# grouping is optional: a BinningModel, a parsed SQL scorecard, or omit.
+result = evaluate_segments(df, cols, Gates(n_jobs=4), grouping=grouping)
+written = result.save_artifacts("artefacts/")
 ```
 
 Pass `submodel=True` to add an XGBoost sub-model alongside the logistic refit.
@@ -54,17 +57,16 @@ interaction; other parameters are overridable through `xgb_params`.
 ### Smart data creation
 
 More often you only know the table and a handful of columns. Supply the
-mandatory three and let the resolver infer the rest from the database:
+mandatory inputs and let the resolver infer the rest from the database:
 
 ```python
-from scorecard_segment_eval import (
-    ScorecardColumns, confirm_settings, load_settings, resolve_metadata,
-)
+from scorecard_segment_eval import confirm_settings, load_settings, resolve_metadata
 
 meta = resolve_metadata(
     table="risk.base_table",
-    cols=ScorecardColumns(col_id="SKP_CREDIT_CASE", col_score="PD",
-                          cols_pred_used=["x1", "x2"]),
+    col_id="SKP_CREDIT_CASE",
+    col_score="PD",
+    cols_pred_used=["x1_woe", "x2"],
     executor=executor,
 )
 outcome = confirm_settings(meta)   # shows the summary, asks, then persists
@@ -78,18 +80,65 @@ filename when you do not pass `settings_path`. Tests and scripts bypass the
 prompt with `auto_confirm=True`, with `SCORECARD_EVAL_AUTO_CONFIRM=1`, or just
 by running without a TTY; all three auto-confirm and warn that they did.
 
-Mandatory: `col_id`, `col_score`, `cols_pred_used`. Inferable from the
+Mandatory: `col_id`, `col_score`, and either `cols_pred_used` or a production
+scorecard SQL file (`model_sql` / `model_sql_path`). Inferable from the
 database: `col_date`, `cols_segment`, `col_target`, `col_obs`. Every inferred
 value raises a `MetadataInferenceWarning` naming the field and how it was
 derived, so an inference is never silent.
 
+### Production scorecard SQL
+
+A logistic scorecard written as SQL (CASE WHEN WoE bins, `nvl(LN(p/(1-p)), impute)`
+logit / VAL columns, then `LINEAR_SCORE = B^T X` folded through a sigmoid)
+is enough to reconstruct the pooled model. `parse_scorecard_sql` /
+`parse_scorecard_sql_path` extract:
+
+* `cols_pred` — raw source columns (`indosat_v2`, `featureB`, ...)
+* `cols_pred_woe` — `_WOE` aliases, even when the name does not match
+  (`indosat_v2` → `feature_a_WOE`)
+* `cols_pred_used` — columns in the linear formula (`_WOE`, `_VAL`, or `_LIN`)
+* `formula` — `PD = 1/(1+exp(-LINEAR_SCORE))` with `LINEAR_SCORE = B^T X`
+* `grouping` — bins plus SQL null imputation, written as `grouping.json`
+* `model` — a sklearn `LogisticRegression` with `coef_` / `intercept_` set so
+  `predict_proba` matches the SQL sigmoid (the estimator is not fitted)
+
+```python
+from scorecard_segment_eval import (
+    evaluate_segments, parse_scorecard_sql_path, resolve_metadata,
+)
+
+parsed = parse_scorecard_sql_path("scorecard.sql")
+parsed.save_grouping("grouping.json")
+print(parsed.formula)
+print(parsed.pred_map)          # indosat_v2 -> feature_a_WOE, ...
+df["PD"] = parsed.predict_proba(df)[:, 1]
+
+meta = resolve_metadata(
+    table="risk.base_table",
+    col_id="SKP_CREDIT_CASE",
+    col_score="PD",
+    model_sql_path="scorecard.sql",
+    grouping_path="grouping.json",   # written if the file does not exist
+    executor=executor,
+)
+result = evaluate_segments(df, meta.columns, grouping=meta.grouping)
+# grouping=parsed is accepted too: evaluate_segments unwraps .grouping
+```
+
+SQL `WHEN x < t` / `x >= t` chains are left-closed `[a, b)` bins. Null and else
+branches are stored as `impute` / `missing_note` on each feature in
+`grouping.json`. Mixed CASE expressions (string equals then numeric cuts)
+keep first-match SQL semantics.
+
 `resolve_capabilities` then reports which analyses are available and which are
-blocked. Two inputs cannot be inferred and only degrade the analysis set:
-without `cols_pred` there is no refit, and without `cols_pred_woe` or a
-grouping there is no recalibration and no grouping-based PSI.
+blocked. Without `cols_pred` (and with no scorecard SQL to infer it from)
+there is no refit; without `cols_pred_woe` or a grouping there is no
+recalibration and no grouping-based PSI.
 
 `notebooks/demo_segment_eval.ipynb` runs this flow end to end against a fake
-executor, so it needs no database.
+executor, so it needs no database. It also walks the SQL parser, the
+`cols_pred` → `cols_pred_woe` map, the segment-vs-portfolio grouping comparison,
+and the saved refit / recalibration artefacts.
 
 ## Conventions worth knowing
 
@@ -125,6 +174,25 @@ resolver about a new portfolio. Failing that, a supplied `col_obs` implies its
 `TargetDefault` / `TargetDefaultObs`. The column-name candidate tuples used to
 sniff the table catalogue for dates, portfolios and segments live here too.
 
+### Mapping `cols_pred` onto `cols_pred_woe`
+
+`map_pred_to_woe` pairs raw predictors with the WoE columns the pooled model
+consumes. The usual convention is a `_woe` suffix; when that exact name is
+absent it still matches a unique remaining column by prefix, case, or a
+`woe_` affix. Each WoE column is used at most once:
+
+```python
+from scorecard_segment_eval import map_pred_to_woe
+
+map_pred_to_woe(["predA", "predB"], ["predA_woe"])
+# {'predA': 'predA_woe'}
+```
+
+`ScorecardColumns.pred_woe_map()` applies the same heuristic, and an explicit
+`pred_map` (from parsed scorecard SQL) wins for renamed aliases such as
+`indosat_v2` → `feature_a_WOE`. The resolved map is printed in the metadata
+summary and is what recalibration and grouping reconstruction use.
+
 ### Grouping is serialisable
 
 `BinningModel` fits optimal WoE bins per predictor and round-trips through
@@ -132,6 +200,30 @@ sniff the table catalogue for dates, portfolios and segments live here too.
 `evaluate_segments` switches PSI onto those bins; numeric features without a
 spec fall back to portfolio-level decile edges. `psi_method` in the
 characteristics table records which path each feature took.
+
+A supplied grouping is also the **portfolio baseline**. A refit always fits
+new segment bins; `compare_groupings` then notes per-bin edge shifts, merges
+and splits, WoE shifts and sign flips against that baseline (or against the
+grouping reconstructed from `cols_pred_woe`). The table is
+`result.grouping_comparison`; significant notes are copied onto the segment
+`BinSpec` so the saved grouping carries the commentary.
+
+### Fitted model artefacts
+
+Refit and recalibration both return a `FittedModelArtifact` (grouping +
+estimator) so later scores can be reproduced. After `evaluate_segments`:
+
+```python
+written = result.save_artifacts("artefacts/")
+# artefacts/CHANNEL/inverted/refit/{grouping.json, model.pkl, meta.json}
+
+from scorecard_segment_eval import load_fitted_artifact
+art = load_fitted_artifact(written[0])
+pd_hat = art.predict_proba(new_frame)
+```
+
+A production SQL scorecard becomes the same kind of artefact via
+`parsed.to_artifact()` (`kind="pooled"`, `method="logistic_sql"`).
 
 ### Parallelism is deterministic
 
@@ -168,9 +260,10 @@ checks run as part of `tests/test_py36_compat.py`.
 `decision_table` and `action_list` give the compact tabular verdicts.
 `render_html_report` and `render_markdown_report` build a self-contained
 report — no template engine, no new dependency — with per-segment verdicts, the
-matched-approval-rate Gini comparison, the PSI method per characteristic, refit
-performance and stability findings, and a prioritised recommendation list from
-`recommendations`. `save_report` picks the format from the file extension.
+matched-approval-rate Gini comparison, the PSI method per characteristic, the
+segment-vs-portfolio grouping comparison, refit performance and stability
+findings, and a prioritised recommendation list from `recommendations`.
+`save_report` picks the format from the file extension.
 
 ## Tests
 
