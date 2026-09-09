@@ -175,3 +175,62 @@ def test_binning_model_transform_is_order_stable_and_handles_absent_columns():
     assert full.shape == (len(frame), 2)
     np.testing.assert_allclose(partial[:, 0], full[:, 0])
     np.testing.assert_allclose(partial[:, 1], np.zeros(len(frame)))
+
+
+def _dated_book(n=4000, seed=11):
+    frame = _book(n=n, seed=seed)
+    rng = np.random.default_rng(seed)
+    frame["date"] = pd.Timestamp("2023-01-01") + pd.to_timedelta(
+        rng.integers(0, 400, size=len(frame)), unit="D"
+    )
+    return frame
+
+
+def test_vintage_stability_table_has_rate_share_and_gini():
+    frame = _dated_book()
+    model = BinningModel.fit(frame[["x", "cat"]], frame["y"], Gates())
+    table = model.vintage_stability_table(
+        frame, frame["y"], "date", "x", min_rows=40
+    )
+    assert list(table.columns) == [
+        "feature",
+        "vintage",
+        "bin",
+        "n",
+        "events",
+        "share",
+        "event_rate",
+        "univariate_gini",
+    ]
+    assert not table.empty
+    assert table["feature"].eq("x").all()
+    for _vintage, part in table.groupby("vintage"):
+        assert part["share"].sum() == pytest.approx(1.0, abs=1e-9)
+        assert part["univariate_gini"].nunique() == 1
+        for _, row in part.iterrows():
+            assert row["event_rate"] == pytest.approx(row["events"] / row["n"])
+    assert table["univariate_gini"].median() > 0.1
+
+
+def test_vintage_stability_table_empty_without_date_or_spec():
+    frame = _dated_book(n=800, seed=2)
+    model = BinningModel.fit(frame[["x"]], frame["y"], Gates())
+    empty_date = model.vintage_stability_table(frame, frame["y"], "nope", "x")
+    empty_feat = model.vintage_stability_table(frame, frame["y"], "date", "missing")
+    assert empty_date.empty
+    assert empty_feat.empty
+
+
+def test_plot_vintage_stability_three_subplots():
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    frame = _dated_book(n=2500, seed=8)
+    model = BinningModel.fit(frame[["x"]], frame["y"], Gates())
+    fig, axes = model.plot_vintage_stability(
+        frame, frame["y"], "date", "x", min_rows=40
+    )
+    assert fig is not None
+    assert len(axes) == 3
+    assert axes[0].get_ylabel() == "event rate"
+    assert axes[1].get_ylabel() == "share"
+    assert axes[2].get_ylabel() == "univariate Gini"

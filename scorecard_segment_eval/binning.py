@@ -914,6 +914,172 @@ class BinningModel(object):
             )
         return pd.DataFrame(rows)
 
+    def vintage_stability_table(self, X, y, date_col, feature, freq="M", min_rows=30):
+        # type: (pd.DataFrame, Any, str, str, str, int) -> pd.DataFrame
+        """Per-bin event rate, share and univariate Gini over scoring vintages.
+
+        One row per ``(vintage, bin)``.  ``univariate_gini`` is the vintage-level
+        Gini of the transformed predictor (repeated on every bin row of that
+        vintage).  WoE features use ``gini(y, -woe)`` so a positive WoE (safer
+        than average) is scored in the risk direction; logit / VAL features use
+        ``gini(y, logit)`` because a larger log-odds is already higher risk.
+
+        Imported lazily so :mod:`scorecard_segment_eval.stability` can keep
+        importing :class:`BinningModel` at module level.
+        """
+        from scorecard_segment_eval.metrics import gini
+        from scorecard_segment_eval.stability import vintage_labels
+
+        columns = [
+            "feature",
+            "vintage",
+            "bin",
+            "n",
+            "events",
+            "share",
+            "event_rate",
+            "univariate_gini",
+        ]
+        spec = self.specs.get(feature)
+        frame = pd.DataFrame(X).reset_index(drop=True)
+        y_arr = np.asarray(pd.Series(y).reset_index(drop=True), dtype=float)
+        if spec is None or feature not in frame.columns:
+            return pd.DataFrame(columns=columns)
+        if date_col not in frame.columns:
+            return pd.DataFrame(columns=columns)
+
+        periods = vintage_labels(frame[date_col], freq=freq)
+        labels_all = spec.assign(frame[feature])
+        woe_all = spec.transform_woe(frame[feature])
+        is_logit = spec.kind == "logit" or spec.transform == "logit"
+        order = list(spec.bin_order())
+        seen = set(order)
+        for label in labels_all:
+            if label not in seen:
+                order.append(label)
+                seen.add(label)
+
+        counts = periods.value_counts(dropna=True)
+        kept = sorted([p for p in counts.index if counts[p] >= min_rows], key=str)
+        rows = []
+        for period in kept:
+            mask = (periods == period).to_numpy()
+            n_v = int(mask.sum())
+            if n_v < min_rows:
+                continue
+            y_v = y_arr[mask]
+            labels_v = labels_all[mask]
+            woe_v = woe_all[mask]
+            score = woe_v if is_logit else -woe_v
+            g_v = gini(y_v, score)
+            for label in order:
+                bin_mask = labels_v == label
+                n_bin = int(bin_mask.sum())
+                if n_bin <= 0:
+                    continue
+                events = float(y_v[bin_mask].sum())
+                rows.append(
+                    {
+                        "feature": feature,
+                        "vintage": str(period),
+                        "bin": str(label),
+                        "n": float(n_bin),
+                        "events": events,
+                        "share": float(n_bin) / float(n_v),
+                        "event_rate": events / float(n_bin) if n_bin else float("nan"),
+                        "univariate_gini": g_v,
+                    }
+                )
+        if not rows:
+            return pd.DataFrame(columns=columns)
+        return pd.DataFrame(rows, columns=columns)
+
+    def plot_vintage_stability(
+        self,
+        X,
+        y,
+        date_col,
+        feature,
+        freq="M",
+        min_rows=30,
+        figsize=None,
+    ):
+        # type: (pd.DataFrame, Any, str, str, str, int, Optional[Tuple[float, float]]) -> Tuple[Any, Any]
+        """Three stacked subplots of WoE grouping stability over vintages.
+
+        Top: true event rate by bin.  Middle: bin share.  Bottom: univariate
+        Gini of the transformed predictor.  Requires the optional ``plot``
+        extra (``matplotlib``).
+        """
+        try:
+            import matplotlib.pyplot as plt
+        except Exception:
+            raise ImportError(
+                "plot_vintage_stability requires matplotlib; install with: "
+                "pip install 'scorecard-segment-eval[plot]'"
+            )
+        table = self.vintage_stability_table(
+            X, y, date_col, feature, freq=freq, min_rows=min_rows
+        )
+        if table.empty:
+            raise ValueError(
+                "no vintage/bin rows to plot for feature %r (missing spec, "
+                "date column, or vintages below min_rows=%s)" % (feature, min_rows)
+            )
+        vintages = []  # type: List[str]
+        for value in table["vintage"].tolist():
+            text = str(value)
+            if text not in vintages:
+                vintages.append(text)
+        x_pos = list(range(len(vintages)))
+        bins = []  # type: List[str]
+        for value in table["bin"].tolist():
+            text = str(value)
+            if text not in bins:
+                bins.append(text)
+        fig, axes = plt.subplots(
+            3, 1, sharex=True, figsize=figsize or (10.0, 8.0)
+        )
+        for bin_label in bins:
+            part = table.loc[table["bin"].astype(str) == bin_label]
+            by_v = dict(
+                (str(row["vintage"]), row)
+                for _, row in part.iterrows()
+            )
+            rates = [
+                float(by_v[v]["event_rate"]) if v in by_v else float("nan")
+                for v in vintages
+            ]
+            shares = [
+                float(by_v[v]["share"]) if v in by_v else float("nan")
+                for v in vintages
+            ]
+            axes[0].plot(x_pos, rates, marker="o", label=bin_label)
+            axes[1].plot(x_pos, shares, marker="o", label=bin_label)
+        gini_by_v = table.drop_duplicates("vintage")
+        gini_lookup = dict(
+            (str(row["vintage"]), float(row["univariate_gini"]))
+            for _, row in gini_by_v.iterrows()
+        )
+        ginis = [
+            gini_lookup[v] if v in gini_lookup else float("nan") for v in vintages
+        ]
+        axes[2].plot(x_pos, ginis, marker="o", color="black")
+        axes[0].set_ylabel("event rate")
+        axes[1].set_ylabel("share")
+        axes[2].set_ylabel("univariate Gini")
+        axes[2].set_xlabel("vintage")
+        axes[0].set_title("%s — true event rate" % feature)
+        axes[1].set_title("bin share")
+        axes[2].set_title("univariate Gini")
+        axes[1].set_ylim(0.0, 1.0)
+        axes[2].set_xticks(x_pos)
+        axes[2].set_xticklabels(vintages, rotation=45, ha="right")
+        if len(bins) <= 12:
+            axes[0].legend(loc="best", fontsize="small", ncol=2)
+        fig.tight_layout()
+        return fig, axes
+
     # -- serialisation -----------------------------------------------------
     def to_dict(self):
         # type: () -> Dict[str, Any]

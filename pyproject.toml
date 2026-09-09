@@ -25,7 +25,8 @@ dev = ["pytest>=3.6", "vermin>=1.5"]
 # falls back to a pure scikit-learn path when they are absent.
 binning = ["optbinning>=0.8"]
 submodel = ["xgboost>=1.0"]
-all = ["optbinning>=0.8", "xgboost>=1.0"]
+plot = ["matplotlib>=3.0"]
+all = ["optbinning>=0.8", "xgboost>=1.0", "matplotlib>=3.0"]
 
 [tool.setuptools]
 include-package-data = true
