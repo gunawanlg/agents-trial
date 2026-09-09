@@ -95,6 +95,44 @@ def information_value(labels, y, eps=_WOE_EPS):
     return float(table["iv_part"].sum())
 
 
+def binomial_rate_bound(events, n, z=1.64):
+    # type: (float, float, float) -> Tuple[float, float]
+    """Wilson score interval for a binomial event rate."""
+    n = float(n)
+    if n <= 0:
+        return float("nan"), float("nan")
+    k = float(np.clip(events, 0.0, n))
+    p = k / n
+    z = float(z)
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    centre = (p + z2 / (2.0 * n)) / denom
+    inner = p * (1.0 - p) / n + z2 / (4.0 * n * n)
+    if inner < 0:
+        inner = 0.0
+    margin = z * math.sqrt(inner) / denom
+    lo = max(0.0, centre - margin)
+    hi = min(1.0, centre + margin)
+    return lo, hi
+
+
+def _is_logit_spec(spec):
+    # type: (BinSpec) -> bool
+    return spec.kind == "logit" or spec.transform == "logit"
+
+
+def _has_numeric_edges(spec):
+    # type: (BinSpec) -> bool
+    return spec.edges is not None and len(spec.edges) >= 2
+
+
+def _numeric_bin_count(spec):
+    # type: (BinSpec) -> int
+    if spec.edges is None:
+        return 0
+    return max(len(spec.edges) - 1, 0)
+
+
 # --------------------------------------------------------------------------
 # Edge helpers
 # --------------------------------------------------------------------------
@@ -844,21 +882,26 @@ class BinningModel(object):
 
     # -- fitting -----------------------------------------------------------
     @classmethod
-    def fit(cls, X, y, gates=None, n_jobs=None):
-        # type: (pd.DataFrame, Any, Optional[Gates], Optional[int]) -> "BinningModel"
+    def fit(cls, X, y, gates=None, n_jobs=None, date_col=None):
+        # type: (pd.DataFrame, Any, Optional[Gates], Optional[int], Optional[str]) -> "BinningModel"
         gates = gates or Gates()
         frame = pd.DataFrame(X).reset_index(drop=True)
         y_series = pd.Series(y).reset_index(drop=True)
         columns = list(frame.columns)
+        fit_cols = [c for c in columns if c != date_col]
 
         def _one(col):
             # type: (str) -> Tuple[str, BinSpec]
             return col, fit_bin_spec(frame[col], y_series, gates=gates, feature=str(col))
 
         jobs = n_jobs if n_jobs is not None else gates.n_jobs
-        pairs = map_jobs(_one, columns, n_jobs=jobs, cap=gates.max_workers_cap)
+        pairs = map_jobs(_one, fit_cols, n_jobs=jobs, cap=gates.max_workers_cap)
         model = cls(specs=dict(pairs), gates=gates)
-        model.columns = [str(c) for c in columns]
+        model.columns = [str(c) for c in fit_cols]
+        if date_col is not None and date_col in frame.columns:
+            model.merge_overlapping_event_rate_bounds(
+                frame, y_series, date_col, gates=gates
+            )
         return model
 
     # -- application -------------------------------------------------------
@@ -913,6 +956,251 @@ class BinningModel(object):
                 }
             )
         return pd.DataFrame(rows)
+
+    def vintage_stability_table(self, X, y, date_col, feature, freq="M", min_rows=30):
+        # type: (pd.DataFrame, Any, str, str, str, int) -> pd.DataFrame
+        """Per-bin event rate, share and univariate Gini over scoring vintages.
+
+        One row per ``(vintage, bin)``.  ``univariate_gini`` is the vintage-level
+        Gini of the transformed predictor (repeated on every bin row of that
+        vintage).  WoE features use ``gini(y, -woe)`` so a positive WoE (safer
+        than average) is scored in the risk direction; logit / VAL features use
+        ``gini(y, logit)`` because a larger log-odds is already higher risk.
+
+        Imported lazily so :mod:`scorecard_segment_eval.stability` can keep
+        importing :class:`BinningModel` at module level.
+        """
+        from scorecard_segment_eval.metrics import gini
+        from scorecard_segment_eval.stability import vintage_labels
+
+        columns = [
+            "feature",
+            "vintage",
+            "bin",
+            "n",
+            "events",
+            "share",
+            "event_rate",
+            "univariate_gini",
+        ]
+        spec = self.specs.get(feature)
+        frame = pd.DataFrame(X).reset_index(drop=True)
+        y_arr = np.asarray(pd.Series(y).reset_index(drop=True), dtype=float)
+        if spec is None or feature not in frame.columns:
+            return pd.DataFrame(columns=columns)
+        if date_col not in frame.columns:
+            return pd.DataFrame(columns=columns)
+
+        periods = vintage_labels(frame[date_col], freq=freq)
+        labels_all = spec.assign(frame[feature])
+        woe_all = spec.transform_woe(frame[feature])
+        is_logit = spec.kind == "logit" or spec.transform == "logit"
+        order = list(spec.bin_order())
+        seen = set(order)
+        for label in labels_all:
+            if label not in seen:
+                order.append(label)
+                seen.add(label)
+
+        counts = periods.value_counts(dropna=True)
+        kept = sorted([p for p in counts.index if counts[p] >= min_rows], key=str)
+        rows = []
+        for period in kept:
+            mask = (periods == period).to_numpy()
+            n_v = int(mask.sum())
+            if n_v < min_rows:
+                continue
+            y_v = y_arr[mask]
+            labels_v = labels_all[mask]
+            woe_v = woe_all[mask]
+            score = woe_v if is_logit else -woe_v
+            g_v = gini(y_v, score)
+            for label in order:
+                bin_mask = labels_v == label
+                n_bin = int(bin_mask.sum())
+                if n_bin <= 0:
+                    continue
+                events = float(y_v[bin_mask].sum())
+                rows.append(
+                    {
+                        "feature": feature,
+                        "vintage": str(period),
+                        "bin": str(label),
+                        "n": float(n_bin),
+                        "events": events,
+                        "share": float(n_bin) / float(n_v),
+                        "event_rate": events / float(n_bin) if n_bin else float("nan"),
+                        "univariate_gini": g_v,
+                    }
+                )
+        if not rows:
+            return pd.DataFrame(columns=columns)
+        return pd.DataFrame(rows, columns=columns)
+
+    def plot_vintage_stability(
+        self,
+        X,
+        y,
+        date_col,
+        feature,
+        freq="M",
+        min_rows=30,
+        figsize=None,
+    ):
+        # type: (pd.DataFrame, Any, str, str, str, int, Optional[Tuple[float, float]]) -> Tuple[Any, Any]
+        """Three stacked subplots of WoE grouping stability over vintages.
+
+        Top: true event rate by bin.  Middle: bin share.  Bottom: univariate
+        Gini of the transformed predictor.  Requires the optional ``plot``
+        extra (``matplotlib``).
+        """
+        try:
+            import matplotlib.pyplot as plt
+        except Exception:
+            raise ImportError(
+                "plot_vintage_stability requires matplotlib; install with: "
+                "pip install 'scorecard-segment-eval[plot]'"
+            )
+        table = self.vintage_stability_table(
+            X, y, date_col, feature, freq=freq, min_rows=min_rows
+        )
+        if table.empty:
+            raise ValueError(
+                "no vintage/bin rows to plot for feature %r (missing spec, "
+                "date column, or vintages below min_rows=%s)" % (feature, min_rows)
+            )
+        vintages = []  # type: List[str]
+        for value in table["vintage"].tolist():
+            text = str(value)
+            if text not in vintages:
+                vintages.append(text)
+        x_pos = list(range(len(vintages)))
+        bins = []  # type: List[str]
+        for value in table["bin"].tolist():
+            text = str(value)
+            if text not in bins:
+                bins.append(text)
+        fig, axes = plt.subplots(
+            3, 1, sharex=True, figsize=figsize or (10.0, 8.0)
+        )
+        for bin_label in bins:
+            part = table.loc[table["bin"].astype(str) == bin_label]
+            by_v = dict(
+                (str(row["vintage"]), row)
+                for _, row in part.iterrows()
+            )
+            rates = [
+                float(by_v[v]["event_rate"]) if v in by_v else float("nan")
+                for v in vintages
+            ]
+            shares = [
+                float(by_v[v]["share"]) if v in by_v else float("nan")
+                for v in vintages
+            ]
+            axes[0].plot(x_pos, rates, marker="o", label=bin_label)
+            axes[1].plot(x_pos, shares, marker="o", label=bin_label)
+        gini_by_v = table.drop_duplicates("vintage")
+        gini_lookup = dict(
+            (str(row["vintage"]), float(row["univariate_gini"]))
+            for _, row in gini_by_v.iterrows()
+        )
+        ginis = [
+            gini_lookup[v] if v in gini_lookup else float("nan") for v in vintages
+        ]
+        axes[2].plot(x_pos, ginis, marker="o", color="black")
+        axes[0].set_ylabel("event rate")
+        axes[1].set_ylabel("share")
+        axes[2].set_ylabel("univariate Gini")
+        axes[2].set_xlabel("vintage")
+        axes[0].set_title("%s — true event rate" % feature)
+        axes[1].set_title("bin share")
+        axes[2].set_title("univariate Gini")
+        axes[1].set_ylim(0.0, 1.0)
+        axes[2].set_xticks(x_pos)
+        axes[2].set_xticklabels(vintages, rotation=45, ha="right")
+        if len(bins) <= 12:
+            axes[0].legend(loc="best", fontsize="small", ncol=2)
+        fig.tight_layout()
+        return fig, axes
+
+    def clone(self):
+        # type: () -> "BinningModel"
+        """Deep copy via the JSON round-trip, so SQL specs are never mutated."""
+        return BinningModel.from_dict(self.to_dict())
+
+    def refresh_stats(self, X, y):
+        # type: (pd.DataFrame, Any) -> "BinningModel"
+        """Recompute per-bin counts / WoE on ``X`` (logit specs are left as-is)."""
+        frame = pd.DataFrame(X).reset_index(drop=True)
+        y_arr = np.asarray(pd.Series(y).reset_index(drop=True).to_numpy(), dtype=float)
+        for col in self.columns:
+            spec = self.specs.get(col)
+            if spec is None or col not in frame.columns:
+                continue
+            if _is_logit_spec(spec):
+                continue
+            _finalise_stats(spec, frame[col], y_arr)
+        return self
+
+    def event_rate_bounds(self, X, y, date_col, feature, freq="M", min_rows=30, z=1.64):
+        # type: (pd.DataFrame, Any, str, str, str, int, float) -> Dict[str, Tuple[float, float]]
+        """Per-bin event-rate envelope across vintages (Wilson CI union)."""
+        table = self.vintage_stability_table(
+            X, y, date_col, feature, freq=freq, min_rows=min_rows
+        )
+        return _bounds_from_vintage_table(table, z=z)
+
+    def overlapping_event_rate_pairs(self, X, y, date_col, feature, freq="M", min_rows=30, z=1.64):
+        # type: (pd.DataFrame, Any, str, str, str, int, float) -> List[Tuple[str, str]]
+        """Adjacent bins whose vintage event-rate bounds overlap."""
+        spec = self.specs.get(feature)
+        if spec is None or _is_logit_spec(spec):
+            return []
+        bounds = self.event_rate_bounds(
+            X, y, date_col, feature, freq=freq, min_rows=min_rows, z=z
+        )
+        order = _adjacent_bin_labels(spec)
+        pairs = []  # type: List[Tuple[str, str]]
+        for i in range(len(order) - 1):
+            a = order[i]
+            b = order[i + 1]
+            if a not in bounds or b not in bounds:
+                continue
+            if _intervals_overlap(bounds[a], bounds[b]):
+                pairs.append((a, b))
+        return pairs
+
+    def merge_overlapping_event_rate_bounds(
+        self, X, y, date_col, gates=None, freq="M", min_rows=30
+    ):
+        # type: (pd.DataFrame, Any, str, Optional[Gates], str, int) -> "BinningModel"
+        """Merge adjacent bins whose vintage event-rate CIs overlap.
+
+        Numeric features drop the shared edge.  Categorical features merge the
+        two groups.  Logit / VAL specs are left untouched.  Remaining overlaps
+        (typically two bins that still overlap) are noted on the spec.
+        """
+        gates = gates or self.gates or Gates()
+        if not bool(getattr(gates, "stability_merge_overlapping_rates", True)):
+            return self
+        z = float(getattr(gates, "delta_gini_z", 1.64) or 1.64)
+        frame = pd.DataFrame(X).reset_index(drop=True)
+        y_arr = np.asarray(pd.Series(y).reset_index(drop=True).to_numpy(), dtype=float)
+        for col in list(self.columns):
+            spec = self.specs.get(col)
+            if spec is None or col not in frame.columns or _is_logit_spec(spec):
+                continue
+            _merge_spec_overlapping_rates(
+                spec,
+                frame[col],
+                y_arr,
+                frame,
+                date_col,
+                freq=freq,
+                min_rows=min_rows,
+                z=z,
+            )
+        return self
 
     # -- serialisation -----------------------------------------------------
     def to_dict(self):
@@ -980,6 +1268,145 @@ def grouping_from_dict(payload):
     # type: (Dict[str, Any]) -> BinningModel
     """Rebuild a grouping from a ``grouping.json`` payload."""
     return BinningModel.from_dict(payload)
+
+
+def _intervals_overlap(a, b):
+    # type: (Tuple[float, float], Tuple[float, float]) -> bool
+    a_lo, a_hi = a
+    b_lo, b_hi = b
+    if not (np.isfinite(a_lo) and np.isfinite(a_hi) and np.isfinite(b_lo) and np.isfinite(b_hi)):
+        return False
+    return not (a_hi < b_lo or b_hi < a_lo)
+
+
+def _bounds_from_vintage_table(table, z=1.64):
+    # type: (pd.DataFrame, float) -> Dict[str, Tuple[float, float]]
+    """Event-rate envelope per bin: the range of vintage point rates.
+
+    Wilson intervals are used only to ignore vintages whose CI is so wide it
+    is uninformative; the bound itself is min/max of the point event rates so
+    a strong monotone grouping is not collapsed by the union of 24 CIs.
+    """
+    bounds = {}  # type: Dict[str, Tuple[float, float]]
+    if table is None or table.empty or "bin" not in table.columns:
+        return bounds
+    z = float(z) if z is not None else 1.64
+    for bin_label, part in table.groupby("bin"):
+        rates = []  # type: List[float]
+        for _idx, row in part.iterrows():
+            n = float(row["n"])
+            events = float(row["events"])
+            if n <= 0:
+                continue
+            rate = float(row["event_rate"])
+            lo, hi = binomial_rate_bound(events, n, z=z)
+            # Drop a vintage whose interval covers almost the whole [0, 1]
+            # range: it carries no ordering information.
+            if np.isfinite(lo) and np.isfinite(hi) and (hi - lo) >= 0.9:
+                continue
+            if np.isfinite(rate):
+                rates.append(rate)
+        if len(rates) >= 2:
+            bounds[str(bin_label)] = (float(min(rates)), float(max(rates)))
+        elif len(rates) == 1:
+            lo, hi = binomial_rate_bound(
+                float(part["events"].iloc[0]), float(part["n"].iloc[0]), z=z
+            )
+            if np.isfinite(lo) and np.isfinite(hi):
+                bounds[str(bin_label)] = (lo, hi)
+    return bounds
+
+
+def _adjacent_bin_labels(spec):
+    # type: (BinSpec) -> List[str]
+    """Reporting-order labels excluding missing/other, numeric bins first."""
+    skip = set([spec.missing_label, OTHER_LABEL])
+    if _has_numeric_edges(spec):
+        n_num = _numeric_bin_count(spec)
+        labels = [str(lab) for lab in spec.labels[:n_num] if str(lab) not in skip]
+        extra = [
+            str(lab)
+            for lab in spec.labels[n_num:]
+            if str(lab) not in skip
+        ]
+        return labels + extra
+    return [str(lab) for lab in spec.bin_order() if str(lab) not in skip]
+
+
+def _merge_spec_overlapping_rates(spec, series, y_arr, frame, date_col, freq, min_rows, z):
+    # type: (BinSpec, Any, np.ndarray, pd.DataFrame, str, str, int, float) -> None
+    """In-place merge until adjacent vintage event-rate bounds no longer overlap."""
+    dummy = BinningModel(specs={spec.feature: spec}, gates=Gates())
+    dummy.columns = [spec.feature]
+    guard = 0
+    merged = 0
+    while guard < 40:
+        guard += 1
+        pairs = dummy.overlapping_event_rate_pairs(
+            frame, y_arr, date_col, spec.feature, freq=freq, min_rows=min_rows, z=z
+        )
+        if not pairs:
+            break
+        a, b = pairs[0]
+        if not _merge_two_bins(spec, a, b, series, y_arr):
+            if "overlapping_event_rate_bounds" not in spec.notes:
+                spec.notes.append("overlapping_event_rate_bounds")
+            break
+        merged += 1
+        spec.notes.append("merged_overlapping_event_rate_bounds")
+    if merged and "merged_overlapping_event_rate_bounds" not in spec.notes:
+        spec.notes.append("merged_overlapping_event_rate_bounds")
+
+
+def _merge_two_bins(spec, label_a, label_b, series, y_arr):
+    # type: (BinSpec, str, str, Any, np.ndarray) -> bool
+    """Merge ``label_a`` into ``label_b``'s neighbour.  Returns False if impossible."""
+    if _has_numeric_edges(spec):
+        n_num = _numeric_bin_count(spec)
+        labels = [str(lab) for lab in spec.labels[:n_num]]
+        try:
+            i = labels.index(str(label_a))
+            j = labels.index(str(label_b))
+        except ValueError:
+            return False
+        if abs(i - j) != 1:
+            return False
+        drop = max(i, j)  # drop the shared interior edge
+        if drop <= 0 or drop >= len(spec.edges) - 1:
+            return False
+        if len(spec.edges) <= 3:
+            return False
+        spec.edges = [float(e) for k, e in enumerate(spec.edges) if k != drop]
+        extra = list(spec.labels[n_num:])
+        spec.labels = edge_labels(spec.edges, closed=spec.closed) + extra
+        _finalise_stats(spec, series, y_arr)
+        return True
+    groups = spec.groups or {}
+    if str(label_a) not in groups or str(label_b) not in groups:
+        return False
+    if len(spec.labels) <= 2:
+        return False
+    members = list(groups.get(str(label_a), [])) + list(groups.get(str(label_b), []))
+    new_label = "|".join(sorted(set(members)))
+    if len(new_label) > 60:
+        new_label = "grp_merged"
+    new_groups = {}  # type: Dict[str, List[str]]
+    new_labels = []  # type: List[str]
+    replaced = False
+    for label in spec.labels:
+        if str(label) in (str(label_a), str(label_b)):
+            if replaced:
+                continue
+            new_groups[new_label] = members
+            new_labels.append(new_label)
+            replaced = True
+        else:
+            new_groups[str(label)] = list(groups.get(str(label), []))
+            new_labels.append(str(label))
+    spec.groups = new_groups
+    spec.labels = new_labels
+    _finalise_stats(spec, series, y_arr)
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -1118,6 +1545,9 @@ def resolve_portfolio_spec(feature, portfolio_grouping, pred_woe_map=None):
     specs = portfolio_grouping.specs or {}
     if feature in specs:
         return specs[feature]
+    for spec in specs.values():
+        if getattr(spec, "output_name", None) == feature or spec.feature == feature:
+            return spec
     pred_woe_map = pred_woe_map or {}
     woe_name = pred_woe_map.get(feature)
     if woe_name and woe_name in specs:
@@ -1216,9 +1646,35 @@ def compare_bin_specs(segment_spec, portfolio_spec, gates=None):
     # type: (BinSpec, BinSpec, Optional[Gates]) -> List[Dict[str, Any]]
     """Per-bin comparison of two grouping definitions for one predictor."""
     gates = gates or Gates()
-    if segment_spec.kind == "numeric" and portfolio_spec.kind == "numeric":
-        if segment_spec.edges and portfolio_spec.edges:
-            return _compare_numeric_specs(segment_spec, portfolio_spec, gates)
+    if _is_logit_spec(segment_spec) and _is_logit_spec(portfolio_spec):
+        return [
+            _comparison_row(
+                feature=segment_spec.feature,
+                segment_bin="logit",
+                portfolio_bins="logit",
+                woe_segment=float("nan"),
+                woe_portfolio=float("nan"),
+                kind="aligned",
+                significant=False,
+                note="%s kept in logit form (VAL/LIN)" % (segment_spec.feature,),
+            )
+        ]
+    if _is_logit_spec(segment_spec) != _is_logit_spec(portfolio_spec):
+        return [
+            _comparison_row(
+                feature=segment_spec.feature,
+                segment_bin="__feature__",
+                portfolio_bins="",
+                woe_segment=float("nan"),
+                woe_portfolio=float("nan"),
+                kind="form_change",
+                significant=True,
+                note="%s logit form vs WoE bins (segment kind=%s, portfolio kind=%s)"
+                % (segment_spec.feature, segment_spec.kind, portfolio_spec.kind),
+            )
+        ]
+    if _has_numeric_edges(segment_spec) and _has_numeric_edges(portfolio_spec):
+        return _compare_numeric_specs(segment_spec, portfolio_spec, gates)
     return _compare_categorical_specs(segment_spec, portfolio_spec, gates)
 
 
@@ -1275,22 +1731,26 @@ def _compare_numeric_specs(seg_spec, port_spec, gates):
     p_edges = [float(e) for e in (port_spec.edges or [])]
     if len(s_edges) < 2 or len(p_edges) < 2:
         return _compare_categorical_specs(seg_spec, port_spec, gates)
+    n_seg = _numeric_bin_count(seg_spec)
+    n_port = _numeric_bin_count(port_spec)
+    seg_labels = list(seg_spec.labels[:n_seg]) if seg_spec.labels else edge_labels(s_edges, closed=seg_spec.closed)
+    port_labels = list(port_spec.labels[:n_port]) if port_spec.labels else edge_labels(p_edges, closed=port_spec.closed)
 
     def _overlaps(s_lo, s_hi):
         # type: (float, float) -> List[Tuple[int, str, float, float]]
         hits = []  # type: List[Tuple[int, str, float, float]]
-        for j, plabel in enumerate(port_spec.labels):
+        for j, plabel in enumerate(port_labels):
             p_lo, p_hi = p_edges[j], p_edges[j + 1]
             if s_lo < p_hi and p_lo < s_hi:
                 hits.append((j, plabel, p_lo, p_hi))
         return hits
 
-    for i, label in enumerate(seg_spec.labels):
+    for i, label in enumerate(seg_labels):
         s_lo, s_hi = s_edges[i], s_edges[i + 1]
         woe_s = _woe_of(seg_spec, label)
         hits = _overlaps(s_lo, s_hi)
-        port_labels = [h[1] for h in hits]
-        port_joined = ",".join(port_labels)
+        hit_names = [h[1] for h in hits]
+        port_joined = ",".join(hit_names)
         if not hits:
             rows.append(
                 _comparison_row(
@@ -1378,10 +1838,10 @@ def _compare_numeric_specs(seg_spec, port_spec, gates):
         )
 
     # Flag portfolio bins that were split across several segment bins.
-    for j, plabel in enumerate(port_spec.labels):
+    for j, plabel in enumerate(port_labels):
         p_lo, p_hi = p_edges[j], p_edges[j + 1]
         covering = []
-        for i, label in enumerate(seg_spec.labels):
+        for i, label in enumerate(seg_labels):
             s_lo, s_hi = s_edges[i], s_edges[i + 1]
             if p_lo < s_hi and s_lo < p_hi:
                 covering.append(label)

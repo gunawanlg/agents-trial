@@ -54,7 +54,7 @@ from scorecard_segment_eval.report import (
     render_markdown_report,
     save_report,
 )
-from scorecard_segment_eval.schema import Gates, ScorecardColumns, map_pred_to_woe
+from scorecard_segment_eval.schema import Gates, ScorecardColumns, map_pred_to_val, map_pred_to_woe
 from scorecard_segment_eval.sql_model import (
     ScorecardSQLModel,
     parse_scorecard_sql,
@@ -85,6 +85,7 @@ __all__ = [
     "Gates",
     "ScorecardColumns",
     "map_pred_to_woe",
+    "map_pred_to_val",
     "ScorecardSQLModel",
     "parse_scorecard_sql",
     "parse_scorecard_sql_path",

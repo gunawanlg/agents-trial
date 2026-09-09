@@ -106,3 +106,44 @@ def test_categorical_membership_change_is_noted():
     mixed = table.loc[table["kind"].str.contains("membership_change")]
     assert not mixed.empty
     assert mixed["significant"].all()
+
+
+def test_sql_grouping_numeric_and_mixed_compare_by_edges():
+    import os
+
+    from scorecard_segment_eval.sql_model import parse_scorecard_sql_path
+
+    fixture = os.path.join(os.path.dirname(__file__), "fixtures", "sample_scorecard.sql")
+    parsed = parse_scorecard_sql_path(fixture)
+    rng = np.random.default_rng(4)
+    n = 2500
+    frame = pd.DataFrame(
+        {
+            "indosat_v2": rng.uniform(0.0, 0.12, size=n),
+            "featureB": rng.uniform(0.0, 8.0, size=n),
+            "y": rng.binomial(1, 0.12, size=n),
+        }
+    )
+    segment = BinningModel.fit(frame[["indosat_v2", "featureB"]], frame["y"], Gates())
+    table = compare_groupings(segment, parsed.grouping, gates=Gates())
+    assert not table.empty
+    assert set(table["feature"]) >= {"indosat_v2", "featureB"}
+    assert "no_portfolio_spec" not in set(table["kind"])
+    # Mixed SQL specs have edges; comparison must use them rather than crash.
+    assert table.loc[table["feature"].eq("indosat_v2"), "kind"].notna().all()
+
+
+def test_sql_logit_versus_woe_is_a_form_change():
+    import os
+
+    from scorecard_segment_eval.sql_model import parse_scorecard_sql_path
+
+    fixture = os.path.join(os.path.dirname(__file__), "fixtures", "sample_scorecard.sql")
+    parsed = parse_scorecard_sql_path(fixture)
+    segment = BinningModel(
+        specs={
+            "featE": _numeric_spec("featE", [-np.inf, 0.2, np.inf], [0.3, -0.3]),
+        }
+    )
+    table = compare_groupings(segment, parsed.grouping, gates=Gates())
+    assert (table["kind"] == "form_change").any()

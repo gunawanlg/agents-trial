@@ -235,6 +235,12 @@ def test_scorecard_columns_pred_map_wins_over_suffix():
     assert mapping["indosat_v2"] == "feature_a_WOE"
     assert mapping["featureB"] == "featureB_WOE"
     assert "featE" not in mapping
+    assert cols.pred_val_map()["featE"] == "featE_VAL"
+    logit = cols.logit_pred_cols(grouping=parsed.grouping)
+    assert "featE" in logit
+    assert "featF_v3_0" in logit
+    assert "indosat_v2" not in logit
+    assert "featureB" not in logit
 
 
 def test_evaluate_accepts_sql_model_as_grouping():

@@ -221,6 +221,7 @@ def _run_holdout_models(
                 cols_pred_woe=list(cols.cols_pred_woe or []),
                 segment_col=segment_col,
                 segment_value=segment_value,
+                logit_cols=cols.logit_pred_cols(grouping=grouping),
             )
             delta = bootstrap_delta_gini(
                 y,

@@ -182,7 +182,13 @@ def predictor_stability(
     counts = periods.value_counts(dropna=True)
     kept = sorted([p for p in counts.index if counts[p] >= min_rows_per_vintage], key=str)
     if grouping is None:
-        grouping = BinningModel.fit(frame[features], frame[target_col], gates=gates, n_jobs=1)
+        if date_col is not None and date_col in frame.columns:
+            fit_frame = frame[list(features) + [c for c in [date_col] if c not in features]]
+            grouping = BinningModel.fit(
+                fit_frame, frame[target_col], gates=gates, n_jobs=1, date_col=date_col
+            )
+        else:
+            grouping = BinningModel.fit(frame[features], frame[target_col], gates=gates, n_jobs=1)
 
     def _one(feature):
         # type: (str) -> Dict[str, Any]
@@ -276,6 +282,17 @@ def predictor_stability(
             flags.append("sign_flip")
         if np.isfinite(score) and score < gates.stability_score_min:
             flags.append("low_stability_score")
+        overlap_pairs = grouping.overlapping_event_rate_pairs(
+            frame,
+            y_all,
+            date_col,
+            feature,
+            freq=freq,
+            min_rows=min_rows_per_vintage,
+            z=float(getattr(gates, "delta_gini_z", 1.64) or 1.64),
+        )
+        if overlap_pairs:
+            flags.append("overlapping_event_rate_bounds")
         return {
             "feature": feature,
             "n_vintages": len(psis),
