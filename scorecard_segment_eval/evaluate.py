@@ -459,6 +459,19 @@ def _dominant_psi_method(char):
     return str(counts.index[0])
 
 
+def _coerce_grouping(grouping):
+    # type: (Any) -> Optional[BinningModel]
+    """Accept a ``BinningModel`` or a parsed scorecard that carries one."""
+    if grouping is None:
+        return None
+    if isinstance(grouping, BinningModel):
+        return grouping
+    inner = getattr(grouping, "grouping", None)
+    if isinstance(inner, BinningModel):
+        return inner
+    return grouping
+
+
 def evaluate_segments(
     df,
     cols,
@@ -468,12 +481,19 @@ def evaluate_segments(
     submodel=False,
     xgb_params=None,
 ):
-    # type: (pd.DataFrame, ScorecardColumns, Optional[Gates], Optional[BinningModel], Optional[int], bool, Optional[Dict[str, Any]]) -> SegmentEvalResult
+    # type: (pd.DataFrame, ScorecardColumns, Optional[Gates], Any, Optional[int], bool, Optional[Dict[str, Any]]) -> SegmentEvalResult
     """Evaluate every segment value of every segmentation column.
+
+    ``grouping`` is a :class:`~scorecard_segment_eval.binning.BinningModel`, or
+    a parsed SQL scorecard (``ScorecardSQLModel`` / ``ResolvedMetadata``) whose
+    ``grouping`` attribute is used.  Pass the grouping parsed from production
+    SQL so PSI and the refit comparison use those bins, including null
+    imputation.
 
     ``n_jobs`` controls the per-segment fan-out (``None`` falls back to
     ``Gates.n_jobs``).  Results are identical for any worker count.
     """
+    grouping = _coerce_grouping(grouping)
     gates = gates or Gates()
     jobs = n_jobs if n_jobs is not None else gates.n_jobs
     obs_all = df.loc[observable_mask(df, cols)].copy()

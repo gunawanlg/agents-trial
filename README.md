@@ -78,15 +78,50 @@ filename when you do not pass `settings_path`. Tests and scripts bypass the
 prompt with `auto_confirm=True`, with `SCORECARD_EVAL_AUTO_CONFIRM=1`, or just
 by running without a TTY; all three auto-confirm and warn that they did.
 
-Mandatory: `col_id`, `col_score`, `cols_pred_used`. Inferable from the
+Mandatory: `col_id`, `col_score`, and either `cols_pred_used` or a production
+scorecard SQL file (`model_sql` / `model_sql_path`). Inferable from the
 database: `col_date`, `cols_segment`, `col_target`, `col_obs`. Every inferred
 value raises a `MetadataInferenceWarning` naming the field and how it was
 derived, so an inference is never silent.
 
+### Production scorecard SQL
+
+A logistic scorecard written as SQL (CASE WHEN WoE bins, `nvl(LN(p/(1-p)), impute)`
+logit / VAL columns, then `LINEAR_SCORE = B^T X` folded through a sigmoid)
+is enough to reconstruct the pooled model:
+
+```python
+from scorecard_segment_eval import (
+    evaluate_segments, parse_scorecard_sql_path, resolve_metadata,
+)
+
+parsed = parse_scorecard_sql_path("scorecard.sql")
+parsed.save_grouping("grouping.json")          # includes null imputation
+# parsed.model is a sklearn LogisticRegression with coef_ / intercept_ set
+# parsed.formula is PD = 1/(1+exp(-LINEAR_SCORE)), LINEAR_SCORE = B^T X
+
+meta = resolve_metadata(
+    table="risk.base_table",
+    col_id="SKP_CREDIT_CASE",
+    col_score="PD",
+    model_sql_path="scorecard.sql",
+    grouping_path="grouping.json",   # written if the file does not exist
+    executor=executor,
+)
+df["PD"] = parsed.predict_proba(df)[:, 1]
+result = evaluate_segments(df, meta.columns, grouping=meta.grouping)
+```
+
+`cols_pred` are the raw source columns, `cols_pred_woe` the `_WOE` aliases,
+and `cols_pred_used` the columns in the linear formula (`_WOE`, `_VAL`, or
+`_LIN`).  SQL `WHEN x < t` / `x >= t` chains are left-closed `[a, b)` bins;
+null and else branches are stored as `impute` / `missing_note` on each
+feature in `grouping.json`.
+
 `resolve_capabilities` then reports which analyses are available and which are
-blocked. Two inputs cannot be inferred and only degrade the analysis set:
-without `cols_pred` there is no refit, and without `cols_pred_woe` or a
-grouping there is no recalibration and no grouping-based PSI.
+blocked. Without `cols_pred` (and with no scorecard SQL to infer it from)
+there is no refit; without `cols_pred_woe` or a grouping there is no
+recalibration and no grouping-based PSI.
 
 `notebooks/demo_segment_eval.ipynb` runs this flow end to end against a fake
 executor, so it needs no database.
