@@ -16,14 +16,16 @@ somebody chose rather than to a hidden constant.
 
 ```bash
 pip install -e .                # core, runs on Python 3.6+
-pip install -e ".[all]"         # plus optbinning and xgboost
+pip install -e ".[all]"         # plus optbinning, xgboost and matplotlib
 pip install -e ".[dev]"         # plus pytest and vermin
+pip install -e ".[plot]"        # matplotlib, for grouping vintage plots
 ```
 
-`optbinning` and `xgboost` are strictly optional. When either is absent the
-package warns once and falls back to a scikit-learn-only path: a decision-tree
-grouping instead of `optbinning`, and logistic regression instead of the
-XGBoost sub-model.
+`optbinning`, `xgboost` and `matplotlib` are strictly optional. When either
+accelerator is absent the package warns once and falls back to a
+scikit-learn-only path: a decision-tree grouping instead of `optbinning`, and
+logistic regression instead of the XGBoost sub-model. Grouping vintage plots
+raise a clear `ImportError` until `matplotlib` is installed.
 
 ## The two entry paths
 
@@ -140,6 +142,10 @@ executor, so it needs no database. It also walks the SQL parser, the
 `cols_pred` → `cols_pred_woe` map, the segment-vs-portfolio grouping comparison,
 and the saved refit / recalibration artefacts.
 
+`notebooks/q2_actions.ipynb` is the shorter walk-through of the three Q2
+actions on the synthetic book: `KEEP_POOLED` (core), `RECALIBRATE` (miscal)
+and `SPLIT` (inverted), including the grouping vintage plot.
+
 ## Conventions worth knowing
 
 ### SQL lives in files, never in Python
@@ -193,6 +199,14 @@ map_pred_to_woe(["predA", "predB"], ["predA_woe"])
 `indosat_v2` → `feature_a_WOE`. The resolved map is printed in the metadata
 summary and is what recalibration and grouping reconstruction use.
 
+`map_pred_to_val` is the VAL / LIN counterpart (`featE` → `featE_VAL`). When a
+predictor has both a WoE alias and a `_VAL` / `_LIN` alias, a same-predictor
+refit **keeps the logit form** `log(p/(1-p))` instead of re-binning it as WoE.
+`ScorecardColumns.logit_pred_cols(grouping)` is the list `evaluate_segments`
+passes through; an explicit VAL/LIN alias beats a WoE alias, then a logit
+spec on the portfolio / SQL grouping, then a raw column that already looks like
+`_VAL` / `_LIN`. A caller-supplied grouping is never rewritten.
+
 ### Grouping is serialisable
 
 `BinningModel` fits optimal WoE bins per predictor and round-trips through
@@ -201,10 +215,16 @@ summary and is what recalibration and grouping reconstruction use.
 spec fall back to portfolio-level decile edges. `psi_method` in the
 characteristics table records which path each feature took.
 
-A supplied grouping is also the **portfolio baseline**. A refit always fits
-new segment bins; `compare_groupings` then notes per-bin edge shifts, merges
-and splits, WoE shifts and sign flips against that baseline (or against the
-grouping reconstructed from `cols_pred_woe`). The table is
+`grouping.vintage_stability_table(...)` is the long frame of per-bin true
+event rate, share and univariate Gini over vintages.
+`grouping.plot_vintage_stability(...)` draws those as three stacked subplots
+(requires `matplotlib`).
+
+A supplied grouping is also the **portfolio baseline**. A refit fits new
+segment WoE bins for ordinary predictors, but keeps SQL `_VAL` / `_LIN`
+predictors in logit form. `compare_groupings` then notes per-bin edge shifts,
+merges and splits, WoE shifts and sign flips against that baseline (or against
+the grouping reconstructed from `cols_pred_woe`). The table is
 `result.grouping_comparison`; significant notes are copied onto the segment
 `BinSpec` so the saved grouping carries the commentary.
 
