@@ -36,7 +36,7 @@ import numpy as np
 import pandas as pd
 
 from scorecard_segment_eval.parallel import map_jobs
-from scorecard_segment_eval.schema import Gates
+from scorecard_segment_eval.schema import Gates, _norm, _strip_woe_affix
 
 MISSING_LABEL = "__missing__"
 OTHER_LABEL = "__other__"
@@ -793,3 +793,519 @@ def load_grouping(path):
     # type: (str) -> BinningModel
     """Read a ``grouping.json`` definition."""
     return BinningModel.load(path)
+
+
+# --------------------------------------------------------------------------
+# Reconstruct a grouping from already-transformed WoE columns
+# --------------------------------------------------------------------------
+def grouping_from_woe_columns(frame, pred_woe_map, gates=None):
+    # type: (pd.DataFrame, Dict[str, str], Optional[Gates]) -> Optional[BinningModel]
+    """Rebuild a :class:`BinningModel` from raw predictors plus their WoE columns.
+
+    Unique values of each WoE column are treated as the original bins.  When
+    a column is not discrete (more unique values than the binning budget) the
+    predictor is skipped, so a continuous copy of the raw feature is not
+    mistaken for a grouping.
+    """
+    gates = gates or Gates()
+    if frame is None or not pred_woe_map:
+        return None
+    specs = {}  # type: Dict[str, BinSpec]
+    for raw_col, woe_col in pred_woe_map.items():
+        if raw_col not in frame.columns or woe_col not in frame.columns:
+            continue
+        spec = bin_spec_from_woe_column(frame[raw_col], frame[woe_col], feature=str(raw_col), gates=gates)
+        if spec is not None:
+            specs[str(raw_col)] = spec
+    if not specs:
+        return None
+    model = BinningModel(specs=specs, gates=gates)
+    model.columns = [c for c in pred_woe_map if c in specs]
+    return model
+
+
+def bin_spec_from_woe_column(raw, woe, feature="feature", gates=None):
+    # type: (Any, Any, str, Optional[Gates]) -> Optional[BinSpec]
+    """Recover one :class:`BinSpec` from a (raw, WoE) pair of columns."""
+    gates = gates or Gates()
+    raw_s = pd.Series(raw).reset_index(drop=True)
+    woe_s = pd.to_numeric(pd.Series(woe).reset_index(drop=True), errors="coerce")
+    paired = pd.DataFrame({"raw": raw_s, "woe": woe_s})
+    valid = paired.dropna(subset=["woe"])
+    n_unique = int(valid["woe"].nunique())
+    budget = max(int(gates.binning_max_bins) * 3, 4)
+    if n_unique < 2 or n_unique > budget:
+        return None
+    if n_unique > max(int(0.5 * max(len(valid), 1)), budget):
+        return None
+
+    numeric_like = pd.api.types.is_numeric_dtype(raw_s) and raw_s.nunique(dropna=True) > 2
+    if numeric_like:
+        tmp = pd.DataFrame(
+            {
+                "raw": pd.to_numeric(valid["raw"], errors="coerce"),
+                "woe": valid["woe"],
+            }
+        ).dropna()
+        if tmp.empty or int(tmp["woe"].nunique()) < 2:
+            return None
+        grouped = tmp.groupby("woe").agg(lo=("raw", "min"), hi=("raw", "max"), n=("raw", "size"))
+        grouped = grouped.sort_values("lo")
+        los = grouped["lo"].to_numpy(dtype=float)
+        his = grouped["hi"].to_numpy(dtype=float)
+        edges = [-np.inf]
+        for i in range(len(grouped) - 1):
+            edges.append(0.5 * (float(his[i]) + float(los[i + 1])))
+        edges.append(np.inf)
+        labels = edge_labels(edges)
+        woe_map = {}  # type: Dict[str, float]
+        counts = {}  # type: Dict[str, float]
+        for i, (woe_val, row) in enumerate(grouped.iterrows()):
+            if i < len(labels):
+                woe_map[labels[i]] = float(woe_val)
+                counts[labels[i]] = float(row["n"])
+        spec = BinSpec(
+            feature=str(feature),
+            kind="numeric",
+            method="from_woe_column",
+            edges=edges,
+            labels=labels,
+            woe=woe_map,
+            counts=counts,
+            notes=["reconstructed_from_woe_column"],
+        )
+        spec.woe.setdefault(MISSING_LABEL, 0.0)
+        spec.counts.setdefault(MISSING_LABEL, 0.0)
+        spec.woe.setdefault(OTHER_LABEL, 0.0)
+        spec.counts.setdefault(OTHER_LABEL, 0.0)
+        return spec
+
+    tmp = pd.DataFrame(
+        {
+            "level": valid["raw"].map(lambda v: MISSING_LABEL if pd.isna(v) else str(v)),
+            "woe": valid["woe"],
+        }
+    )
+    groups = {}  # type: Dict[str, List[str]]
+    labels = []  # type: List[str]
+    woe_map = {}  # type: Dict[str, float]
+    counts = {}  # type: Dict[str, float]
+    for i, (woe_val, part) in enumerate(tmp.groupby("woe")):
+        members = sorted(set(str(v) for v in part["level"].tolist() if v != MISSING_LABEL))
+        if not members:
+            continue
+        label = "|".join(members) if len("|".join(members)) <= 60 else "grp_%02d" % i
+        if label in groups:
+            label = "grp_%02d" % i
+        groups[label] = members
+        labels.append(label)
+        woe_map[label] = float(woe_val)
+        counts[label] = float(len(part))
+    if not groups:
+        return None
+    spec = BinSpec(
+        feature=str(feature),
+        kind="categorical",
+        method="from_woe_column",
+        groups=groups,
+        labels=labels,
+        woe=woe_map,
+        counts=counts,
+        notes=["reconstructed_from_woe_column"],
+    )
+    spec.woe.setdefault(MISSING_LABEL, 0.0)
+    spec.counts.setdefault(MISSING_LABEL, 0.0)
+    spec.woe.setdefault(OTHER_LABEL, 0.0)
+    spec.counts.setdefault(OTHER_LABEL, 0.0)
+    return spec
+
+
+# --------------------------------------------------------------------------
+# Segment grouping vs portfolio grouping
+# --------------------------------------------------------------------------
+def resolve_portfolio_spec(feature, portfolio_grouping, pred_woe_map=None):
+    # type: (str, Optional[BinningModel], Optional[Dict[str, str]]) -> Optional[BinSpec]
+    """Find the portfolio :class:`BinSpec` that corresponds to ``feature``."""
+    if portfolio_grouping is None:
+        return None
+    specs = portfolio_grouping.specs or {}
+    if feature in specs:
+        return specs[feature]
+    pred_woe_map = pred_woe_map or {}
+    woe_name = pred_woe_map.get(feature)
+    if woe_name and woe_name in specs:
+        return specs[woe_name]
+    reverse = dict((v, k) for k, v in pred_woe_map.items())
+    if feature in reverse and reverse[feature] in specs:
+        return specs[reverse[feature]]
+    want = _norm(_strip_woe_affix(feature))
+    hits = [
+        spec
+        for name, spec in specs.items()
+        if _norm(name) == _norm(feature)
+        or _norm(_strip_woe_affix(name)) == want
+        or _norm(_strip_woe_affix(name)) == _norm(feature)
+    ]
+    if len(hits) == 1:
+        return hits[0]
+    return None
+
+
+def compare_groupings(segment_grouping, portfolio_grouping, pred_woe_map=None, gates=None):
+    # type: (Optional[BinningModel], Optional[BinningModel], Optional[Dict[str, str]], Optional[Gates]) -> pd.DataFrame
+    """Per-bin notes on how a segment grouping differs from the portfolio one.
+
+    Significant differences (WoE shift, sign flip, edge movement, merge/split,
+    category membership change) are also appended onto each segment
+    :class:`BinSpec` ``notes`` list so the saved grouping carries the commentary.
+    """
+    gates = gates or Gates()
+    rows = []  # type: List[Dict[str, Any]]
+    if segment_grouping is None or portfolio_grouping is None:
+        return pd.DataFrame(columns=_COMPARISON_COLUMNS)
+    pred_woe_map = pred_woe_map or {}
+    for feature in segment_grouping.columns:
+        seg_spec = segment_grouping.specs.get(feature)
+        if seg_spec is None:
+            continue
+        port_spec = resolve_portfolio_spec(feature, portfolio_grouping, pred_woe_map)
+        if port_spec is None:
+            row = _comparison_row(
+                feature=feature,
+                segment_bin="__feature__",
+                portfolio_bins="",
+                woe_segment=float("nan"),
+                woe_portfolio=float("nan"),
+                kind="no_portfolio_spec",
+                significant=False,
+                note="no portfolio grouping found for %s" % (feature,),
+            )
+            rows.append(row)
+            continue
+        feature_rows = compare_bin_specs(seg_spec, port_spec, gates=gates)
+        rows.extend(feature_rows)
+        significant_notes = [r["note"] for r in feature_rows if r.get("significant")]
+        for note in significant_notes:
+            tagged = "portfolio_diff: " + note
+            if tagged not in seg_spec.notes:
+                seg_spec.notes.append(tagged)
+    if not rows:
+        return pd.DataFrame(columns=_COMPARISON_COLUMNS)
+    return pd.DataFrame(rows)[_COMPARISON_COLUMNS]
+
+
+_COMPARISON_COLUMNS = [
+    "feature",
+    "segment_bin",
+    "portfolio_bins",
+    "woe_segment",
+    "woe_portfolio",
+    "woe_delta",
+    "kind",
+    "significant",
+    "note",
+]
+
+
+def _comparison_row(feature, segment_bin, portfolio_bins, woe_segment, woe_portfolio, kind, significant, note):
+    # type: (str, str, str, float, float, str, bool, str) -> Dict[str, Any]
+    woe_s = float(woe_segment) if woe_segment == woe_segment else float("nan")
+    woe_p = float(woe_portfolio) if woe_portfolio == woe_portfolio else float("nan")
+    delta = woe_s - woe_p if (np.isfinite(woe_s) and np.isfinite(woe_p)) else float("nan")
+    return {
+        "feature": feature,
+        "segment_bin": segment_bin,
+        "portfolio_bins": portfolio_bins,
+        "woe_segment": woe_s,
+        "woe_portfolio": woe_p,
+        "woe_delta": delta,
+        "kind": kind,
+        "significant": bool(significant),
+        "note": note,
+    }
+
+
+def compare_bin_specs(segment_spec, portfolio_spec, gates=None):
+    # type: (BinSpec, BinSpec, Optional[Gates]) -> List[Dict[str, Any]]
+    """Per-bin comparison of two grouping definitions for one predictor."""
+    gates = gates or Gates()
+    if segment_spec.kind == "numeric" and portfolio_spec.kind == "numeric":
+        if segment_spec.edges and portfolio_spec.edges:
+            return _compare_numeric_specs(segment_spec, portfolio_spec, gates)
+    return _compare_categorical_specs(segment_spec, portfolio_spec, gates)
+
+
+def _woe_of(spec, label):
+    # type: (BinSpec, str) -> float
+    if label in spec.woe:
+        return float(spec.woe[label])
+    return float("nan")
+
+
+def _material_woe_shift(delta, gates):
+    # type: (float, Gates) -> bool
+    return bool(np.isfinite(delta) and abs(delta) >= float(gates.grouping_woe_shift_material))
+
+
+def _sign_flip(woe_s, woe_p, gates):
+    # type: (float, float, Gates) -> bool
+    floor = float(gates.grouping_sign_flip_floor)
+    if not (np.isfinite(woe_s) and np.isfinite(woe_p)):
+        return False
+    if abs(woe_s) < floor or abs(woe_p) < floor:
+        return False
+    return (woe_s > 0) != (woe_p > 0)
+
+
+def _finite_span(lo, hi):
+    # type: (float, float) -> float
+    if np.isfinite(lo) and np.isfinite(hi):
+        return abs(hi - lo)
+    return float("nan")
+
+
+def _edge_shifted(s_lo, s_hi, p_lo, p_hi, gates):
+    # type: (float, float, float, float, Gates) -> bool
+    frac = float(gates.grouping_edge_shift_frac)
+    width = _finite_span(p_lo, p_hi)
+    if not np.isfinite(width) or width <= 0:
+        width = _finite_span(s_lo, s_hi)
+    if not np.isfinite(width) or width <= 0:
+        return (np.isfinite(s_lo) != np.isfinite(p_lo)) or (np.isfinite(s_hi) != np.isfinite(p_hi))
+    lo_shift = abs(s_lo - p_lo) if (np.isfinite(s_lo) and np.isfinite(p_lo)) else 0.0
+    hi_shift = abs(s_hi - p_hi) if (np.isfinite(s_hi) and np.isfinite(p_hi)) else 0.0
+    if not np.isfinite(s_lo) or not np.isfinite(p_lo):
+        lo_shift = 0.0 if (np.isneginf(s_lo) and np.isneginf(p_lo)) else max(lo_shift, width)
+    if not np.isfinite(s_hi) or not np.isfinite(p_hi):
+        hi_shift = 0.0 if (np.isposinf(s_hi) and np.isposinf(p_hi)) else max(hi_shift, width)
+    return (lo_shift >= frac * width) or (hi_shift >= frac * width)
+
+
+def _compare_numeric_specs(seg_spec, port_spec, gates):
+    # type: (BinSpec, BinSpec, Gates) -> List[Dict[str, Any]]
+    rows = []  # type: List[Dict[str, Any]]
+    s_edges = [float(e) for e in (seg_spec.edges or [])]
+    p_edges = [float(e) for e in (port_spec.edges or [])]
+    if len(s_edges) < 2 or len(p_edges) < 2:
+        return _compare_categorical_specs(seg_spec, port_spec, gates)
+
+    def _overlaps(s_lo, s_hi):
+        # type: (float, float) -> List[Tuple[int, str, float, float]]
+        hits = []  # type: List[Tuple[int, str, float, float]]
+        for j, plabel in enumerate(port_spec.labels):
+            p_lo, p_hi = p_edges[j], p_edges[j + 1]
+            if s_lo < p_hi and p_lo < s_hi:
+                hits.append((j, plabel, p_lo, p_hi))
+        return hits
+
+    for i, label in enumerate(seg_spec.labels):
+        s_lo, s_hi = s_edges[i], s_edges[i + 1]
+        woe_s = _woe_of(seg_spec, label)
+        hits = _overlaps(s_lo, s_hi)
+        port_labels = [h[1] for h in hits]
+        port_joined = ",".join(port_labels)
+        if not hits:
+            rows.append(
+                _comparison_row(
+                    feature=seg_spec.feature,
+                    segment_bin=label,
+                    portfolio_bins="",
+                    woe_segment=woe_s,
+                    woe_portfolio=float("nan"),
+                    kind="unmatched",
+                    significant=True,
+                    note="%s bin %s does not overlap any portfolio bin" % (seg_spec.feature, label),
+                )
+            )
+            continue
+        # Primary overlap: largest overlapping span, falling back to first.
+        primary = hits[0]
+        best_span = -1.0
+        for hit in hits:
+            span = min(s_hi, hit[3]) - max(s_lo, hit[2])
+            if not np.isfinite(span):
+                span = 1.0
+            if span > best_span:
+                best_span = span
+                primary = hit
+        woe_p = _woe_of(port_spec, primary[1])
+        kinds = []  # type: List[str]
+        if len(hits) > 1:
+            kinds.append("merged")
+        if _edge_shifted(s_lo, s_hi, primary[2], primary[3], gates):
+            kinds.append("edge_shift")
+        if _sign_flip(woe_s, woe_p, gates):
+            kinds.append("woe_sign_flip")
+        elif _material_woe_shift(woe_s - woe_p if np.isfinite(woe_s) and np.isfinite(woe_p) else float("nan"), gates):
+            kinds.append("woe_shift")
+        kind = "+".join(kinds) if kinds else "aligned"
+        significant = kind != "aligned"
+        if kind == "aligned":
+            note = "%s bin %s aligns with portfolio %s (WoE %.3f vs %.3f)" % (
+                seg_spec.feature,
+                label,
+                primary[1],
+                woe_s,
+                woe_p,
+            )
+        elif "merged" in kinds:
+            note = (
+                "%s bin %s spans portfolio bins [%s] (segment WoE %.3f vs primary %.3f)"
+                % (seg_spec.feature, label, port_joined, woe_s, woe_p)
+            )
+        elif "woe_sign_flip" in kinds:
+            note = "%s bin %s WoE sign flipped vs portfolio %s (%.3f vs %.3f)" % (
+                seg_spec.feature,
+                label,
+                primary[1],
+                woe_s,
+                woe_p,
+            )
+        elif "woe_shift" in kinds:
+            note = "%s bin %s WoE shifted vs portfolio %s (%.3f vs %.3f)" % (
+                seg_spec.feature,
+                label,
+                primary[1],
+                woe_s,
+                woe_p,
+            )
+        else:
+            note = "%s bin %s edges moved vs portfolio %s (%s vs %s)" % (
+                seg_spec.feature,
+                label,
+                primary[1],
+                label,
+                primary[1],
+            )
+        rows.append(
+            _comparison_row(
+                feature=seg_spec.feature,
+                segment_bin=label,
+                portfolio_bins=port_joined,
+                woe_segment=woe_s,
+                woe_portfolio=woe_p,
+                kind=kind,
+                significant=significant,
+                note=note,
+            )
+        )
+
+    # Flag portfolio bins that were split across several segment bins.
+    for j, plabel in enumerate(port_spec.labels):
+        p_lo, p_hi = p_edges[j], p_edges[j + 1]
+        covering = []
+        for i, label in enumerate(seg_spec.labels):
+            s_lo, s_hi = s_edges[i], s_edges[i + 1]
+            if p_lo < s_hi and s_lo < p_hi:
+                covering.append(label)
+        if len(covering) > 1:
+            woe_p = _woe_of(port_spec, plabel)
+            rows.append(
+                _comparison_row(
+                    feature=seg_spec.feature,
+                    segment_bin=",".join(covering),
+                    portfolio_bins=plabel,
+                    woe_segment=float("nan"),
+                    woe_portfolio=_woe_of(port_spec, plabel),
+                    kind="split",
+                    significant=True,
+                    note="%s portfolio bin %s is split across segment bins [%s]"
+                    % (seg_spec.feature, plabel, ",".join(covering)),
+                )
+            )
+    return rows
+
+
+def _member_lookup(spec):
+    # type: (BinSpec) -> Dict[str, str]
+    lookup = {}  # type: Dict[str, str]
+    for label, members in (spec.groups or {}).items():
+        for member in members:
+            lookup[str(member)] = label
+    return lookup
+
+
+def _compare_categorical_specs(seg_spec, port_spec, gates):
+    # type: (BinSpec, BinSpec, Gates) -> List[Dict[str, Any]]
+    rows = []  # type: List[Dict[str, Any]]
+    port_lookup = _member_lookup(port_spec)
+    seg_labels = list(seg_spec.labels) if seg_spec.labels else list((seg_spec.groups or {}).keys())
+    if not seg_labels:
+        seg_labels = [k for k in seg_spec.woe if k not in (seg_spec.missing_label, OTHER_LABEL)]
+    for label in seg_labels:
+        members = list((seg_spec.groups or {}).get(label) or [])
+        if not members and label in (seg_spec.woe or {}):
+            members = [label]
+        sources = []  # type: List[str]
+        seen = []  # type: List[str]
+        for member in members:
+            src = port_lookup.get(str(member))
+            if src is None:
+                # Numeric fallback: treat the label itself as the portfolio key.
+                if label in port_spec.woe:
+                    src = label
+                else:
+                    src = OTHER_LABEL
+            if src not in seen:
+                seen.append(src)
+            sources.append(src)
+        woe_s = _woe_of(seg_spec, label)
+        primary = seen[0] if seen else ""
+        woe_p = _woe_of(port_spec, primary) if primary else float("nan")
+        kinds = []  # type: List[str]
+        if len(seen) > 1:
+            kinds.append("membership_change")
+        if _sign_flip(woe_s, woe_p, gates):
+            kinds.append("woe_sign_flip")
+        elif _material_woe_shift(
+            (woe_s - woe_p) if (np.isfinite(woe_s) and np.isfinite(woe_p)) else float("nan"),
+            gates,
+        ):
+            kinds.append("woe_shift")
+        kind = "+".join(kinds) if kinds else "aligned"
+        significant = kind != "aligned"
+        if kind == "aligned":
+            note = "%s bin %s matches portfolio %s (WoE %.3f vs %.3f)" % (
+                seg_spec.feature,
+                label,
+                primary,
+                woe_s,
+                woe_p,
+            )
+        elif "membership_change" in kinds:
+            note = "%s bin %s mixes portfolio groups [%s] (WoE %.3f vs primary %.3f)" % (
+                seg_spec.feature,
+                label,
+                ",".join(seen),
+                woe_s,
+                woe_p,
+            )
+        elif "woe_sign_flip" in kinds:
+            note = "%s bin %s WoE sign flipped vs portfolio %s (%.3f vs %.3f)" % (
+                seg_spec.feature,
+                label,
+                primary,
+                woe_s,
+                woe_p,
+            )
+        else:
+            note = "%s bin %s WoE shifted vs portfolio %s (%.3f vs %.3f)" % (
+                seg_spec.feature,
+                label,
+                primary,
+                woe_s,
+                woe_p,
+            )
+        rows.append(
+            _comparison_row(
+                feature=seg_spec.feature,
+                segment_bin=label,
+                portfolio_bins=",".join(seen),
+                woe_segment=woe_s,
+                woe_portfolio=woe_p,
+                kind=kind,
+                significant=significant,
+                note=note,
+            )
+        )
+    return rows
