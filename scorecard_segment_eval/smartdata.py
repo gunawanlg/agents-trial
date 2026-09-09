@@ -9,6 +9,13 @@ guessed:
 ``cols_pred_used``the predictors the pooled model actually consumes
 ================  ======================================================
 
+``cols_pred_used`` may be omitted when ``model_sql`` / ``model_sql_path`` is
+a production logistic scorecard (CASE WHEN WoE bins + ``LN(p/(1-p))`` VAL
+columns + ``LINEAR_SCORE``).  The parser fills ``cols_pred``,
+``cols_pred_woe``, ``cols_pred_used``, the grouping (with SQL null imputation)
+and a sklearn logistic whose ``coef_`` / ``intercept_`` reproduce
+``PD = 1/(1+exp(-B^T X))``.
+
 Everything else is either **inferred from the database** (with a loud warning
 every single time, so an inferred setting is never mistaken for a supplied
 one) or **declared missing**, in which case the analyses that depend on it are
@@ -47,6 +54,7 @@ import pandas as pd
 from scorecard_segment_eval import config
 from scorecard_segment_eval.dbio import render_sql
 from scorecard_segment_eval.schema import ANALYSIS_KEYS, ScorecardColumns
+from scorecard_segment_eval.sql_model import parse_scorecard_sql, parse_scorecard_sql_path
 
 #: Environment variable that forces non-interactive confirmation.
 AUTO_CONFIRM_ENV = "SCORECARD_EVAL_AUTO_CONFIRM"
@@ -105,6 +113,11 @@ class ResolvedMetadata:
     grouping_path: Optional[str] = None
     catalogue: List[str] = field(default_factory=list)
     capabilities: CapabilityReport = field(default_factory=CapabilityReport)
+    formula: Optional[str] = None
+    coefficients: Dict[str, float] = field(default_factory=dict)
+    model_sql_path: Optional[str] = None
+    grouping: Any = None
+    scorecard: Any = None
 
     def inferred_fields(self):
         # type: () -> List[str]
@@ -131,6 +144,9 @@ class ResolvedMetadata:
             "portfolio": self.portfolio,
             "grouping_path": self.grouping_path,
             "catalogue": list(self.catalogue),
+            "formula": self.formula,
+            "coefficients": dict(self.coefficients),
+            "model_sql_path": self.model_sql_path,
         }
 
     @classmethod
@@ -146,7 +162,28 @@ class ResolvedMetadata:
             portfolio=payload.get("portfolio"),
             grouping_path=payload.get("grouping_path"),
             catalogue=list(payload.get("catalogue") or []),
+            formula=payload.get("formula"),
+            coefficients=dict(payload.get("coefficients") or {}),
+            model_sql_path=payload.get("model_sql_path"),
         )
+        if meta.model_sql_path and os.path.isfile(str(meta.model_sql_path)):
+            try:
+                parsed = parse_scorecard_sql_path(str(meta.model_sql_path))
+                meta.scorecard = parsed
+                meta.grouping = parsed.grouping
+                if not meta.formula:
+                    meta.formula = parsed.formula
+                if not meta.coefficients:
+                    meta.coefficients = dict(parsed.coefficients)
+            except (OSError, ValueError):
+                pass
+        elif meta.grouping_path and os.path.isfile(str(meta.grouping_path)):
+            try:
+                from scorecard_segment_eval.binning import load_grouping
+
+                meta.grouping = load_grouping(str(meta.grouping_path))
+            except (OSError, ValueError, KeyError):
+                pass
         meta.capabilities = resolve_capabilities(meta)
         return meta
 
@@ -408,7 +445,7 @@ def resolve_metadata(
     table,
     col_id,
     col_score,
-    cols_pred_used,
+    cols_pred_used=None,
     executor=None,
     col_date=None,
     cols_segment=None,
@@ -423,27 +460,53 @@ def resolve_metadata(
     grouping_path=None,
     sample_limit=100000,
     warn=True,
+    model_sql=None,
+    model_sql_path=None,
 ):
-    # type: (str, str, str, Sequence[str], Optional[Callable[[str], pd.DataFrame]], Optional[str], Optional[Sequence[str]], Optional[str], Optional[str], Optional[str], Optional[str], Optional[Sequence[str]], Optional[Sequence[str]], Optional[str], Optional[str], Optional[str], int, bool) -> ResolvedMetadata
+    # type: (str, str, str, Optional[Sequence[str]], Optional[Callable[[str], pd.DataFrame]], Optional[str], Optional[Sequence[str]], Optional[str], Optional[str], Optional[str], Optional[str], Optional[Sequence[str]], Optional[Sequence[str]], Optional[str], Optional[str], Optional[str], int, bool, Optional[str], Optional[str]) -> ResolvedMetadata
     """Resolve the full analysis metadata from a minimal user specification.
 
     Raises ``ValueError`` when a mandatory input is absent.  Every field that
     ends up inferred or fetched emits a :class:`MetadataInferenceWarning` and
     is recorded in ``sources``.
+
+    ``model_sql`` / ``model_sql_path`` is a production logistic scorecard in
+    SQL form.  When supplied it fills ``cols_pred``, ``cols_pred_woe``,
+    ``cols_pred_used``, the grouping (with SQL null imputation) and the
+    pooled logistic coefficients, unless the caller already set those.
     """
+    parsed = None
+    sql_path = str(model_sql_path) if model_sql_path else None
+    if sql_path:
+        parsed = parse_scorecard_sql_path(sql_path)
+    elif model_sql:
+        parsed = parse_scorecard_sql(model_sql)
+
     if not table:
         raise ValueError("table is mandatory")
     if not col_id:
         raise ValueError("col_id is mandatory (the credit case id)")
     if not col_score:
         raise ValueError("col_score is mandatory")
-    if not cols_pred_used:
+    if not cols_pred_used and parsed is None:
         raise ValueError("cols_pred_used is mandatory (predictors the pooled model uses)")
 
     meta = ResolvedMetadata(table=str(table), columns=ScorecardColumns(col_id=str(col_id)))
     meta.sources["col_id"] = "supplied"
     meta.sources["col_score"] = "supplied"
-    meta.sources["cols_pred_used"] = "supplied"
+    if cols_pred_used:
+        meta.sources["cols_pred_used"] = "supplied"
+    elif parsed is not None:
+        meta.sources["cols_pred_used"] = "inferred:sql_model"
+        cols_pred_used = list(parsed.cols_pred_used)
+        _emit(
+            meta,
+            "cols_pred_used was not supplied: inferred %s from the scorecard SQL."
+            % (list(cols_pred_used),),
+            warn,
+        )
+    else:
+        meta.sources["cols_pred_used"] = "missing"
 
     catalogue, types = _catalogue(executor, meta.table)
     meta.catalogue = list(catalogue)
@@ -502,6 +565,15 @@ def resolve_metadata(
     if cols_pred:
         meta.sources["cols_pred"] = "supplied"
         resolved_pred = [str(c) for c in cols_pred]
+    elif parsed is not None and parsed.cols_pred:
+        resolved_pred = list(parsed.cols_pred)
+        meta.sources["cols_pred"] = "inferred:sql_model"
+        _emit(
+            meta,
+            "cols_pred was not supplied: inferred %s from the scorecard SQL."
+            % (resolved_pred,),
+            warn,
+        )
     else:
         resolved_pred = []
         meta.sources["cols_pred"] = "missing"
@@ -516,6 +588,15 @@ def resolve_metadata(
     if cols_pred_woe:
         meta.sources["cols_pred_woe"] = "supplied"
         resolved_woe = [str(c) for c in cols_pred_woe]
+    elif parsed is not None and parsed.cols_pred_woe:
+        resolved_woe = list(parsed.cols_pred_woe)
+        meta.sources["cols_pred_woe"] = "inferred:sql_model"
+        _emit(
+            meta,
+            "cols_pred_woe was not supplied: inferred %s from the scorecard SQL."
+            % (resolved_woe,),
+            warn,
+        )
     else:
         resolved_woe = []
         meta.sources["cols_pred_woe"] = "missing"
@@ -526,10 +607,23 @@ def resolve_metadata(
             warn,
         )
 
+    pred_map = dict(parsed.pred_map) if parsed is not None else {}
+
     if grouping_path:
         meta.grouping_path = str(grouping_path)
         exists = os.path.isfile(str(grouping_path))
-        meta.sources["grouping_path"] = "supplied" if exists else "missing"
+        if parsed is not None and parsed.grouping is not None and not exists:
+            parsed.grouping.save(str(grouping_path))
+            exists = True
+            meta.sources["grouping_path"] = "inferred:sql_model"
+            _emit(
+                meta,
+                "grouping_path %r did not exist: wrote the grouping parsed from "
+                "the scorecard SQL (including null imputation)." % (str(grouping_path),),
+                warn,
+            )
+        else:
+            meta.sources["grouping_path"] = "supplied" if exists else "missing"
         if not exists:
             _emit(
                 meta,
@@ -546,11 +640,24 @@ def resolve_metadata(
                 % (str(grouping_path),),
                 warn,
             )
+    elif parsed is not None and parsed.grouping is not None:
+        meta.sources["grouping_path"] = "inferred:sql_model"
+        meta.grouping = parsed.grouping
     else:
         meta.sources["grouping_path"] = "missing"
 
     if col_fantomas:
         meta.sources["col_fantomas"] = "supplied"
+
+    if parsed is not None:
+        meta.formula = parsed.formula
+        meta.coefficients = dict(parsed.coefficients)
+        meta.model_sql_path = sql_path
+        meta.grouping = parsed.grouping
+        meta.scorecard = parsed
+        if parsed.grouping is not None and meta.grouping_path:
+            # already saved above when the file was missing
+            pass
 
     meta.columns = ScorecardColumns(
         col_id=str(col_id),
@@ -562,7 +669,8 @@ def resolve_metadata(
         cols_segment=resolved_segments,
         col_fantomas=str(col_fantomas) if col_fantomas else None,
         cols_pred_woe=resolved_woe,
-        cols_pred_used=[str(c) for c in cols_pred_used],
+        cols_pred_used=[str(c) for c in (cols_pred_used or [])],
+        pred_map=pred_map,
     )
     meta.capabilities = resolve_capabilities(meta)
     return meta
@@ -596,7 +704,10 @@ def resolve_capabilities(meta):
     has_date = bool(cols.col_date)
     has_pred = bool(cols.cols_pred)
     has_woe = bool(cols.cols_pred_woe)
-    grouping_ok = bool(meta.grouping_path) and meta.sources.get("grouping_path") == "supplied"
+    grouping_ok = bool(meta.grouping is not None) or (
+        bool(meta.grouping_path)
+        and meta.sources.get("grouping_path") in ("supplied", "inferred:sql_model")
+    )
 
     _mark(
         "segment_performance",
@@ -703,9 +814,18 @@ def render_metadata_summary(meta):
     for name, value in fields:
         source = meta.sources.get(name, "not_set")
         if name == "pred_woe_map":
-            source = "derived" if cols.cols_pred_woe and cols.cols_pred else source
+            source = (
+                "derived"
+                if (cols.cols_pred_woe and cols.cols_pred) or cols.pred_map
+                else source
+            )
         shown = ", ".join(str(v) for v in value) if isinstance(value, list) else str(value)
         lines.append("  %-16s %-40s [%s]" % (name + ":", shown if shown else "-", source))
+    if meta.formula:
+        lines.append("")
+        lines.append("Pooled model formula:")
+        for line in str(meta.formula).splitlines():
+            lines.append("  " + line)
     if meta.warnings:
         lines.append("")
         lines.append("Warnings (%d):" % (len(meta.warnings),))
@@ -863,12 +983,64 @@ def required_columns(meta):
     return out
 
 
+def _scorecard_fillable(meta, frame):
+    # type: (ResolvedMetadata, Optional[pd.DataFrame]) -> List[str]
+    parsed = meta.scorecard
+    if parsed is None or frame is None:
+        return []
+    preds = list(parsed.cols_pred or [])
+    if not preds or any(c not in frame.columns for c in preds):
+        return []
+    fillable = []  # type: List[str]
+    if meta.columns.col_score:
+        fillable.append(str(meta.columns.col_score))
+    fillable.extend(list(parsed.cols_pred_woe or ()))
+    fillable.extend(list(parsed.cols_pred_used or ()))
+    out = []  # type: List[str]
+    for name in fillable:
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def _apply_scorecard_columns(meta, frame, warn):
+    # type: (ResolvedMetadata, pd.DataFrame, bool) -> pd.DataFrame
+    parsed = meta.scorecard
+    if parsed is None:
+        return frame
+    preds = list(parsed.cols_pred or [])
+    if not preds or any(c not in frame.columns for c in preds):
+        return frame
+    score_col = meta.columns.col_score or "SCORE"
+    scored = parsed.transform_frame(frame, score_col=score_col)
+    added = []  # type: List[str]
+    for col in scored.columns:
+        if col not in frame.columns:
+            frame[col] = scored[col]
+            added.append(col)
+        elif col == score_col and frame[col].isna().all():
+            frame[col] = scored[col]
+            added.append(col)
+    if added and warn:
+        warnings.warn(
+            "filled %s from the parsed scorecard SQL (PD = 1/(1+exp(-B^T X)))."
+            % (", ".join(added),),
+            MetadataInferenceWarning,
+            stacklevel=3,
+        )
+    return frame
+
+
 def build_analysis_frame(meta, executor, base=None, warn=True):
     # type: (ResolvedMetadata, Optional[Callable[[str], pd.DataFrame]], Optional[pd.DataFrame], bool) -> pd.DataFrame
     """Assemble the analysis frame, fetching only what ``base`` is missing.
 
     Fetched columns are merged on ``col_id``.  A warning names every column
     that came from the database rather than from the caller.
+
+    When a production scorecard SQL model is attached to ``meta`` and the
+    raw predictors are already in the frame, missing score / WoE / VAL
+    columns are computed from that model instead of being fetched.
     """
     wanted = required_columns(meta)
     col_id = meta.columns.col_id
@@ -878,8 +1050,13 @@ def build_analysis_frame(meta, executor, base=None, warn=True):
     else:
         frame = None
         missing = list(wanted)
+    fillable = _scorecard_fillable(meta, frame)
+    if fillable:
+        missing = [c for c in missing if c not in fillable]
     if not missing:
-        return frame if frame is not None else pd.DataFrame()
+        if frame is None:
+            return pd.DataFrame()
+        return _apply_scorecard_columns(meta, frame, warn)
     if executor is None:
         raise ValueError(
             "columns %s are not in the supplied frame and no executor was given"
@@ -897,5 +1074,7 @@ def build_analysis_frame(meta, executor, base=None, warn=True):
             stacklevel=2,
         )
     if frame is None:
-        return fetched.reset_index(drop=True)
-    return frame.merge(fetched, on=col_id, how="left")
+        frame = fetched.reset_index(drop=True)
+    else:
+        frame = frame.merge(fetched, on=col_id, how="left")
+    return _apply_scorecard_columns(meta, frame, warn)
