@@ -141,6 +141,19 @@ def test_edge_labels_are_unique():
     assert len(set(labels)) == len(labels)
 
 
+def test_left_closed_bins_match_sql_less_than_thresholds():
+    from scorecard_segment_eval.binning import assign_numeric_bins
+
+    edges = [-np.inf, 0.5, 1.5, np.inf]
+    labels = edge_labels(edges, closed="left")
+    assert labels[0].startswith("[")
+    assigned = assign_numeric_bins([0.5, 1.5, 0.0], edges, labels, closed="left")
+    # x < 0.5 is the first bin; x == 0.5 belongs to [0.5, 1.5).
+    assert assigned[0] == labels[1]
+    assert assigned[1] == labels[2]
+    assert assigned[2] == labels[0]
+
+
 def test_information_value_matches_manual_computation():
     y = np.array([1, 1, 0, 0, 0, 0], dtype=float)
     labels = np.array(["a", "a", "a", "b", "b", "b"], dtype=object)
