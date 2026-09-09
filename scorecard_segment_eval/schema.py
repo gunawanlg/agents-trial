@@ -93,6 +93,63 @@ class ScorecardColumns:
             mapping.setdefault(raw, dest)
         return mapping
 
+    def pred_val_map(self):
+        # type: () -> Dict[str, str]
+        """Map each raw predictor onto its logit / VAL / LIN column, when one exists.
+
+        An explicit ``pred_map`` (``featE`` → ``featE_VAL``) wins; remaining
+        columns fall back to a ``_val`` / ``_lin`` suffix heuristic against
+        ``cols_pred_used``.  When both a WoE alias and a VAL/LIN alias exist,
+        the VAL/LIN mapping is still returned here -- callers that prefer
+        logit form should consult this map first.
+        """
+        mapping = {}  # type: Dict[str, str]
+        claimed = set()
+        for raw, dest in (self.pred_map or {}).items():
+            if looks_like_val_column(dest):
+                mapping[str(raw)] = str(dest)
+                claimed.add(str(dest))
+        remaining_pred = [c for c in (self.cols_pred or []) if c not in mapping]
+        remaining_val = []
+        for name in list(self.cols_pred_used or []) + list(self.cols_pred_woe or []):
+            if looks_like_val_column(name) and name not in claimed and name not in remaining_val:
+                remaining_val.append(name)
+        heuristic = map_pred_to_val(remaining_pred, remaining_val)
+        for raw, dest in heuristic.items():
+            mapping.setdefault(raw, dest)
+        return mapping
+
+    def logit_pred_cols(self, grouping=None):
+        # type: (Optional[Any]) -> List[str]
+        """Raw predictors that should stay in logit form on a same-predictor refit.
+
+        Preference order: explicit VAL/LIN alias, then a logit spec on the
+        supplied (portfolio / SQL) grouping, then a raw column that already
+        looks like ``_VAL`` / ``_LIN``.  A VAL/LIN alias beats a WoE alias
+        for the same predictor.
+        """
+        val_mapped = self.pred_val_map()
+        out = []  # type: List[str]
+        seen = set()
+        specs = getattr(grouping, "specs", None) or {}
+        for raw in list(self.cols_pred or []):
+            keep = False
+            if raw in val_mapped:
+                keep = True
+            elif looks_like_val_column(raw):
+                keep = True
+            else:
+                spec = specs.get(raw)
+                if spec is not None and (
+                    getattr(spec, "kind", None) == "logit"
+                    or getattr(spec, "transform", None) == "logit"
+                ):
+                    keep = True
+            if keep and raw not in seen:
+                out.append(raw)
+                seen.add(raw)
+        return out
+
 
 def looks_like_woe_column(name):
     # type: (str) -> bool
@@ -206,6 +263,112 @@ def map_pred_to_woe(cols_pred, cols_pred_woe):
                 w
                 for w in remaining
                 if _norm(_strip_woe_affix(w)).startswith(want) or want.startswith(_norm(_strip_woe_affix(w)))
+            ]
+            if len(hits) == 1:
+                chosen = _take(hits[0])
+        if chosen is not None:
+            mapping[pred] = chosen
+    return mapping
+
+
+#: Affixes used to recognise a logit / VAL / LIN column name.
+_VAL_SUFFIXES = ("_val", "_lin")
+_VAL_PREFIXES = ("val_", "lin_")
+
+
+def _strip_val_affix(name):
+    # type: (str) -> str
+    text = str(name).strip()
+    lowered = text.lower()
+    for suffix in _VAL_SUFFIXES:
+        if lowered.endswith(suffix) and len(lowered) > len(suffix):
+            return text[: len(text) - len(suffix)]
+    for prefix in _VAL_PREFIXES:
+        if lowered.startswith(prefix) and len(lowered) > len(prefix):
+            rest = text[len(prefix) :]
+            if rest.startswith("_"):
+                rest = rest[1:]
+            return rest
+    return text
+
+
+def map_pred_to_val(cols_pred, cols_pred_val):
+    # type: (Optional[Sequence[str]], Optional[Sequence[str]]) -> Dict[str, str]
+    """Map ``cols_pred`` onto logit / VAL / LIN columns.
+
+    Same pairing rules as :func:`map_pred_to_woe`, with ``_val`` / ``_lin``
+    (and ``val_`` / ``lin_``) instead of the WoE affix.  Predictors with no
+    counterpart are omitted.
+
+    Example::
+
+        map_pred_to_val(['featE', 'featF'], ['featE_VAL'])
+        # {'featE': 'featE_VAL'}
+    """
+    preds = [str(c) for c in (cols_pred or ()) if str(c)]
+    vals = [str(c) for c in (cols_pred_val or ()) if str(c)]
+    if not preds or not vals:
+        return {}
+
+    remaining = list(vals)
+    mapping = {}  # type: Dict[str, str]
+
+    def _take(candidate):
+        # type: (Optional[str]) -> Optional[str]
+        if candidate is None or candidate not in remaining:
+            return None
+        remaining.remove(candidate)
+        return candidate
+
+    def _find_ci(target):
+        # type: (str) -> Optional[str]
+        needle = _norm(target)
+        hits = [w for w in remaining if _norm(w) == needle]
+        return hits[0] if hits else None
+
+    for pred in preds:
+        chosen = None  # type: Optional[str]
+        chosen = _take(pred) if pred in remaining else None
+        if chosen is None:
+            for candidate in (
+                pred + "_val",
+                pred + "_VAL",
+                pred + "_Val",
+                pred + "_lin",
+                pred + "_LIN",
+                pred + "_Lin",
+                "val_" + pred,
+                "VAL_" + pred,
+                "lin_" + pred,
+                "LIN_" + pred,
+            ):
+                chosen = _take(candidate)
+                if chosen is not None:
+                    break
+        if chosen is None:
+            chosen = _take(_find_ci(pred))
+        if chosen is None:
+            for candidate in (pred + "_val", pred + "_lin", "val_" + pred, "lin_" + pred):
+                chosen = _take(_find_ci(candidate))
+                if chosen is not None:
+                    break
+        if chosen is None:
+            want = _norm(_strip_val_affix(pred))
+            hits = [w for w in remaining if _norm(_strip_val_affix(w)) == want]
+            if len(hits) == 1:
+                chosen = _take(hits[0])
+        if chosen is None:
+            needle = _norm(pred)
+            hits = [w for w in remaining if _norm(w).startswith(needle) and _norm(w) != needle]
+            if len(hits) == 1:
+                chosen = _take(hits[0])
+        if chosen is None:
+            want = _norm(_strip_val_affix(pred))
+            hits = [
+                w
+                for w in remaining
+                if _norm(_strip_val_affix(w)).startswith(want)
+                or want.startswith(_norm(_strip_val_affix(w)))
             ]
             if len(hits) == 1:
                 chosen = _take(hits[0])

@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from scorecard_segment_eval.binning import BinningModel
+from scorecard_segment_eval.binning import BinningModel, BinSpec
 from scorecard_segment_eval.metrics import gini
 from scorecard_segment_eval.refit import (
     MAX_SUBMODEL_DEPTH,
@@ -254,4 +254,57 @@ def test_recalibration_saves_the_logistic_model(tmp_path):
     assert reloaded.kind == "recalibrate"
     np.testing.assert_allclose(reloaded.predict_proba(p_biased), result.p_holdout)
     assert abs(result.intercept) > 0 or abs(result.slope - 1.0) > 0
+
+
+def test_refit_keeps_logit_form_and_woe_bins_the_rest():
+    rng = np.random.default_rng(21)
+    n = 4000
+    dates = pd.Timestamp("2022-01-01") + pd.to_timedelta(
+        rng.integers(0, 400, size=n), unit="D"
+    )
+    x1 = rng.normal(size=n)
+    feat_pd = np.clip(1.0 / (1.0 + np.exp(-(-1.5 + 1.2 * x1))), 0.01, 0.99)
+    y = rng.binomial(1, feat_pd)
+    frame = pd.DataFrame(
+        {"date": dates, "x1": x1, "feat_pd": feat_pd, "y": y}
+    ).sort_values("date").reset_index(drop=True)
+    cut = int(len(frame) * 0.7)
+    train, holdout = frame.iloc[:cut].copy(), frame.iloc[cut:].copy()
+    portfolio = BinningModel(
+        specs={
+            "feat_pd": BinSpec(
+                feature="feat_pd",
+                kind="logit",
+                method="sql_logit",
+                transform="logit",
+                impute=-2.5,
+                labels=["logit"],
+            )
+        }
+    )
+    result = refit_with_diagnostics(
+        train,
+        holdout,
+        ["x1", "feat_pd"],
+        "y",
+        Gates(),
+        date_col="date",
+        logit_cols=["feat_pd"],
+        portfolio_grouping=portfolio,
+    )
+    assert result.method == "logistic_mixed"
+    assert result.grouping.specs["feat_pd"].kind == "logit"
+    assert result.grouping.specs["feat_pd"].transform == "logit"
+    assert result.grouping.specs["feat_pd"].impute == pytest.approx(-2.5)
+    assert "refit_keeps_logit_form" in result.grouping.specs["feat_pd"].notes
+    assert result.grouping.specs["x1"].kind != "logit"
+    assert any(m.startswith("refit_keeps_logit_form") for m in result.messages)
+    assert np.isfinite(result.p_holdout).all()
+    assert gini(holdout["y"].to_numpy(dtype=float), result.p_holdout) > 0.2
+
+    only_logit = refit_with_diagnostics(
+        train, holdout, ["feat_pd"], "y", Gates(), logit_cols=["feat_pd"]
+    )
+    assert only_logit.method == "logistic_logit"
+    assert only_logit.grouping.specs["feat_pd"].kind == "logit"
 

@@ -36,6 +36,8 @@ import pandas as pd
 from sklearn.linear_model import LogisticRegression
 
 from scorecard_segment_eval.binning import (
+    MISSING_LABEL,
+    BinSpec,
     BinningModel,
     compare_groupings,
     grouping_from_woe_columns,
@@ -456,6 +458,83 @@ def _resolve_portfolio_grouping(
     return None, messages
 
 
+def _logit_spec_for_refit(feature, portfolio_grouping):
+    # type: (str, Optional[BinningModel]) -> BinSpec
+    """Keep a predictor in logit form instead of re-binning it as WoE."""
+    port = None
+    if portfolio_grouping is not None:
+        port = portfolio_grouping.specs.get(feature)
+    if port is not None and (port.kind == "logit" or port.transform == "logit"):
+        spec = BinSpec.from_dict(port.to_dict())
+        if "refit_keeps_logit_form" not in spec.notes:
+            spec.notes.append("refit_keeps_logit_form")
+        return spec
+    return BinSpec(
+        feature=feature,
+        kind="logit",
+        method="logit",
+        transform="logit",
+        notes=["refit_keeps_logit_form"],
+        labels=["logit"],
+        woe={"logit": 0.0, MISSING_LABEL: 0.0},
+    )
+
+
+def _build_refit_grouping(
+    train,
+    pred_cols,
+    target_col,
+    gates,
+    n_jobs,
+    logit_cols,
+    portfolio_grouping,
+    messages,
+):
+    # type: (pd.DataFrame, Sequence[str], str, Gates, Optional[int], Optional[Sequence[str]], Optional[BinningModel], List[str]) -> BinningModel
+    """Fit WoE bins, but keep SQL VAL / LIN predictors as ``log(p/(1-p))``."""
+    logit_keep = [c for c in pred_cols if c in set(logit_cols or [])]
+    if not logit_keep:
+        encoder = WoEEncoder(n_bins=gates.n_woe_bins, gates=gates, n_jobs=n_jobs)
+        encoder.fit(train[list(pred_cols)], train[target_col])
+        return encoder.to_grouping()
+
+    messages.append("refit_keeps_logit_form:" + ",".join(logit_keep))
+    specs = {}  # type: Dict[str, BinSpec]
+    woe_cols = [c for c in pred_cols if c not in set(logit_keep)]
+    if woe_cols:
+        fitted = BinningModel.fit(
+            train[woe_cols], train[target_col], gates=gates, n_jobs=n_jobs
+        )
+        for col in woe_cols:
+            specs[col] = fitted.specs[col]
+    for col in logit_keep:
+        specs[col] = _logit_spec_for_refit(col, portfolio_grouping)
+    model = BinningModel(specs=specs, gates=gates)
+    model.columns = list(pred_cols)
+    return model
+
+
+def _logistic_refit_method(grouping):
+    # type: (Optional[BinningModel]) -> str
+    """Name the logistic refit by whether predictors stayed WoE, logit, or mixed."""
+    if grouping is None:
+        return "logistic_woe"
+    kinds = []
+    for col in grouping.columns:
+        spec = grouping.specs.get(col)
+        if spec is None:
+            continue
+        if spec.kind == "logit" or spec.transform == "logit":
+            kinds.append("logit")
+        else:
+            kinds.append("woe")
+    if not kinds or all(k == "woe" for k in kinds):
+        return "logistic_woe"
+    if all(k == "logit" for k in kinds):
+        return "logistic_logit"
+    return "logistic_mixed"
+
+
 def refit_with_diagnostics(
     train,
     holdout,
@@ -473,8 +552,9 @@ def refit_with_diagnostics(
     cols_pred_woe=None,
     segment_col=None,
     segment_value=None,
+    logit_cols=None,
 ):
-    # type: (pd.DataFrame, pd.DataFrame, Sequence[str], str, Optional[Gates], bool, Optional[Dict[str, Any]], Optional[str], Optional[BinningModel], Optional[int], Optional[BinningModel], Optional[Dict[str, str]], Optional[pd.DataFrame], Optional[Sequence[str]], Optional[str], Any) -> RefitResult
+    # type: (pd.DataFrame, pd.DataFrame, Sequence[str], str, Optional[Gates], bool, Optional[Dict[str, Any]], Optional[str], Optional[BinningModel], Optional[int], Optional[BinningModel], Optional[Dict[str, str]], Optional[pd.DataFrame], Optional[Sequence[str]], Optional[str], Any, Optional[Sequence[str]]) -> RefitResult
     """Refit on ``train``, score ``holdout``, and diagnose predictor stability.
 
     The grouping is fitted on the training rows only (or reused when supplied),
@@ -485,6 +565,10 @@ def refit_with_diagnostics(
     grouping is compared to the original / portfolio grouping (``portfolio_grouping``,
     else reconstructed from the WoE columns, else fitted on ``portfolio_frame``)
     and per-bin notes are attached to the saved grouping.
+
+    Predictors listed in ``logit_cols`` (typically SQL ``_VAL`` / ``_LIN``
+    columns) stay in logit form ``log(p/(1-p))`` instead of being re-binned as
+    WoE.  A supplied ``grouping`` is never rewritten.
     """
     gates = gates or Gates()
     pred_cols = [c for c in pred_cols if c in train.columns and c in holdout.columns]
@@ -504,9 +588,16 @@ def refit_with_diagnostics(
 
     y_train = train[target_col].to_numpy(dtype=int)
     if grouping is None:
-        encoder = WoEEncoder(n_bins=gates.n_woe_bins, gates=gates, n_jobs=n_jobs)
-        encoder.fit(train[pred_cols], train[target_col])
-        grouping = encoder.to_grouping()
+        grouping = _build_refit_grouping(
+            train,
+            pred_cols,
+            target_col,
+            gates,
+            n_jobs,
+            logit_cols,
+            portfolio_grouping,
+            messages,
+        )
     x_train = grouping.transform(train[pred_cols])
     x_holdout = grouping.transform(holdout[pred_cols])
 
@@ -532,6 +623,7 @@ def refit_with_diagnostics(
         p_holdout = np.asarray(model.predict_proba(x_holdout)[:, 1], dtype=float)
         coefficients = dict((col, float(val)) for col, val in zip(grouping.columns, model.coef_[0]))
         coefficients["__intercept__"] = float(model.intercept_[0])
+        method = _logistic_refit_method(grouping)
 
     reference = portfolio_frame
     resolved_portfolio, port_messages = _resolve_portfolio_grouping(
@@ -589,8 +681,9 @@ def refit_same_predictors(
     pred_woe_map=None,
     portfolio_frame=None,
     cols_pred_woe=None,
+    logit_cols=None,
 ):
-    # type: (pd.DataFrame, pd.DataFrame, Sequence[str], str, Gates, bool, Optional[Dict[str, Any]], Optional[str], Optional[BinningModel], Optional[int], Optional[BinningModel], Optional[Dict[str, str]], Optional[pd.DataFrame], Optional[Sequence[str]]) -> np.ndarray
+    # type: (pd.DataFrame, pd.DataFrame, Sequence[str], str, Gates, bool, Optional[Dict[str, Any]], Optional[str], Optional[BinningModel], Optional[int], Optional[BinningModel], Optional[Dict[str, str]], Optional[pd.DataFrame], Optional[Sequence[str]], Optional[Sequence[str]]) -> np.ndarray
     """Holdout PDs from a same-predictor refit (unchanged return contract)."""
     result = refit_with_diagnostics(
         train,
@@ -607,6 +700,7 @@ def refit_same_predictors(
         pred_woe_map=pred_woe_map,
         portfolio_frame=portfolio_frame,
         cols_pred_woe=cols_pred_woe,
+        logit_cols=logit_cols,
     )
     return result.p_holdout
 
