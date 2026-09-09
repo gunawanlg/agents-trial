@@ -209,7 +209,7 @@ def test_sklearn_logistic_matches_sql_formula():
     )
     mapped = parsed.grouping.transform_woe(frame)
     x = mapped[parsed.grouping.columns].to_numpy(dtype=float)
-    linear = float(x.dot(model.coef_[0]) + model.intercept_[0])
+    linear = float(np.asarray(x.reshape(1, -1).dot(model.coef_[0]) + model.intercept_).reshape(-1)[0])
     expected_pd = 1.0 / (1.0 + math.exp(-linear))
     proba = parsed.predict_proba(frame)
     assert proba.shape == (1, 2)
@@ -294,11 +294,13 @@ def test_build_analysis_frame_scores_from_sql():
             col_id="id",
             col_score="SCORE",
             col_target="y",
+            col_obs="obs",
             model_sql_path=FIXTURE,
         )
     base = _example_frame()
     base["id"] = list(range(len(base)))
     base["y"] = [0, 1, 0, 1, 0]
+    base["obs"] = [1, 1, 1, 1, 1]
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         frame = build_analysis_frame(meta, executor=None, base=base)
