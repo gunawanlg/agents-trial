@@ -27,6 +27,7 @@ class ScorecardColumns:
     col_fantomas: Optional[str] = None
     cols_pred_woe: List[str] = field(default_factory=list)
     cols_pred_used: List[str] = field(default_factory=list)
+    pred_map: Dict[str, str] = field(default_factory=dict)
 
     def as_dict(self):
         # type: () -> Dict[str, object]
@@ -41,6 +42,7 @@ class ScorecardColumns:
             "col_fantomas": self.col_fantomas,
             "cols_pred_woe": list(self.cols_pred_woe),
             "cols_pred_used": list(self.cols_pred_used),
+            "pred_map": dict(self.pred_map),
         }
 
     @classmethod
@@ -57,6 +59,7 @@ class ScorecardColumns:
             "col_fantomas",
             "cols_pred_woe",
             "cols_pred_used",
+            "pred_map",
         }
         kwargs = {}
         for key, value in payload.items():
@@ -64,13 +67,42 @@ class ScorecardColumns:
                 continue
             if key.startswith("cols_") and value is None:
                 value = []
+            if key == "pred_map" and value is None:
+                value = {}
             kwargs[key] = value
         return cls(**kwargs)  # type: ignore[arg-type]
 
     def pred_woe_map(self):
         # type: () -> Dict[str, str]
-        """Map each raw predictor onto its supplied WoE column, when one exists."""
-        return map_pred_to_woe(self.cols_pred, self.cols_pred_woe)
+        """Map each raw predictor onto its supplied WoE column, when one exists.
+
+        An explicit ``pred_map`` (for example from parsed scorecard SQL, where
+        ``indosat_v2`` may map to ``feature_a_WOE``) wins; remaining columns
+        fall back to the ``_woe`` suffix heuristic.
+        """
+        mapping = {}  # type: Dict[str, str]
+        claimed = set()
+        for raw, dest in (self.pred_map or {}).items():
+            if looks_like_woe_column(dest):
+                mapping[str(raw)] = str(dest)
+                claimed.add(str(dest))
+        remaining_pred = [c for c in (self.cols_pred or []) if c not in mapping]
+        remaining_woe = [c for c in (self.cols_pred_woe or []) if c not in claimed]
+        heuristic = map_pred_to_woe(remaining_pred, remaining_woe)
+        for raw, dest in heuristic.items():
+            mapping.setdefault(raw, dest)
+        return mapping
+
+
+def looks_like_woe_column(name):
+    # type: (str) -> bool
+    return str(name).lower().endswith("_woe")
+
+
+def looks_like_val_column(name):
+    # type: (str) -> bool
+    lowered = str(name).lower()
+    return lowered.endswith("_val") or lowered.endswith("_lin")
 
 
 #: Affixes used to recognise a Weight-of-Evidence column name.
