@@ -147,6 +147,10 @@ def test_supplied_values_are_never_overwritten_and_emit_no_inference_warning():
     assert meta.supplied_fields()
     assert meta.inferred_fields() == []
     assert messages == []
+    assert meta.columns.pred_woe_map() == {"x1": "x1_woe"}
+    summary = render_metadata_summary(meta)
+    assert "x1 -> x1_woe" in summary
+    assert "x2 -> (none)" in summary
 
 
 def test_portfolio_drives_target_detection():
