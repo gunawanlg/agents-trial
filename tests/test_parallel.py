@@ -165,6 +165,7 @@ def test_evaluate_segments_is_identical_serially_and_in_parallel():
         "characteristics",
         "vintage",
         "stability",
+        "grouping_comparison",
     ):
         left = getattr(serial, name)
         right = getattr(parallel, name)

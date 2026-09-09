@@ -717,6 +717,38 @@ def render_html_report(result, title="Segment scorecard evaluation", gates=None,
     ]
     parts.append(html_table(result.refit_comparison, refit_cols, empty_message="No refit was attempted."))
 
+    parts.append("<h2>5b. Segment vs portfolio grouping</h2>")
+    parts.append(
+        '<p class="note">When a segment is refitted, its WoE bins are compared to the original '
+        "portfolio grouping (the supplied grouping, the grouping reconstructed from "
+        "<code>cols_pred_woe</code>, or a grouping fitted on the portfolio). "
+        "Significant differences — edge movement, merge/split, WoE shift or sign flip — "
+        "are noted per bin.</p>"
+    )
+    grouping_cols = [
+        "segment_col",
+        "segment_value",
+        "feature",
+        "segment_bin",
+        "portfolio_bins",
+        "woe_segment",
+        "woe_portfolio",
+        "woe_delta",
+        "kind",
+        "significant",
+        "note",
+    ]
+    grouping_cmp = getattr(result, "grouping_comparison", None)
+    if grouping_cmp is None:
+        grouping_cmp = pd.DataFrame()
+    parts.append(
+        html_table(
+            grouping_cmp,
+            grouping_cols,
+            empty_message="No grouping comparison was produced (no refit, or no portfolio grouping).",
+        )
+    )
+
     parts.append("<h2>6. Predictor stability over vintages</h2>")
     parts.append(
         '<p class="note">A refit is only accepted when its predictors are stable. Weak vintages '
@@ -830,6 +862,23 @@ def render_markdown_report(result, title="Segment scorecard evaluation", gates=N
         _markdown_table(
             result.refit_comparison,
             ["segment_value", "n_holdout", "gini_pooled", "gini_refit", "delta_gini", "delta_gini_ci_low", "refit_method"],
+        )
+    )
+    lines.append("")
+    lines.append("## 5b. Segment vs portfolio grouping")
+    lines.append("")
+    grouping_cmp = getattr(result, "grouping_comparison", None)
+    lines.append(
+        _markdown_table(
+            grouping_cmp,
+            [
+                "segment_value",
+                "feature",
+                "segment_bin",
+                "kind",
+                "significant",
+                "note",
+            ],
         )
     )
     lines.append("")

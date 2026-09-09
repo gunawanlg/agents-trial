@@ -11,7 +11,9 @@ from the backport by a conditional install requirement.
 from scorecard_segment_eval.binning import (
     BinningModel,
     BinSpec,
+    compare_groupings,
     fit_bin_spec,
+    grouping_from_woe_columns,
     load_grouping,
     save_grouping,
 )
@@ -32,10 +34,16 @@ from scorecard_segment_eval.evaluate import SegmentEvalResult, evaluate_segments
 from scorecard_segment_eval.metrics import matched_ar_comparison, performance_bundle
 from scorecard_segment_eval.parallel import map_jobs, resolve_n_jobs
 from scorecard_segment_eval.refit import (
+    FittedModelArtifact,
+    RecalibrateResult,
     RefitResult,
     WoEEncoder,
+    load_fitted_artifact,
+    recalibrate_with_diagnostics,
     refit_same_predictors,
     refit_with_diagnostics,
+    save_fitted_artifact,
+    save_fitted_artifacts,
 )
 from scorecard_segment_eval.report import (
     action_list,
@@ -45,7 +53,7 @@ from scorecard_segment_eval.report import (
     render_markdown_report,
     save_report,
 )
-from scorecard_segment_eval.schema import Gates, ScorecardColumns
+from scorecard_segment_eval.schema import Gates, ScorecardColumns, map_pred_to_woe
 from scorecard_segment_eval.smartdata import (
     CapabilityReport,
     ConfirmationResult,
@@ -70,6 +78,7 @@ __all__ = [
     # schema / gates
     "Gates",
     "ScorecardColumns",
+    "map_pred_to_woe",
     # evaluation
     "SegmentEvalResult",
     "evaluate_segments",
@@ -83,6 +92,8 @@ __all__ = [
     "fit_bin_spec",
     "load_grouping",
     "save_grouping",
+    "compare_groupings",
+    "grouping_from_woe_columns",
     # characteristics / PSI
     "feature_diagnostics",
     "psi_for_feature",
@@ -90,9 +101,15 @@ __all__ = [
     "shape_divergence",
     # refit / stability
     "RefitResult",
+    "RecalibrateResult",
+    "FittedModelArtifact",
     "WoEEncoder",
     "refit_same_predictors",
     "refit_with_diagnostics",
+    "recalibrate_with_diagnostics",
+    "save_fitted_artifact",
+    "save_fitted_artifacts",
+    "load_fitted_artifact",
     "predictor_stability",
     "stability_summary",
     # smart data

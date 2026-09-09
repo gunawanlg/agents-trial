@@ -8,9 +8,12 @@ from scorecard_segment_eval.binning import BinningModel
 from scorecard_segment_eval.metrics import gini
 from scorecard_segment_eval.refit import (
     MAX_SUBMODEL_DEPTH,
+    FittedModelArtifact,
     WoEEncoder,
     fit_submodel,
+    load_fitted_artifact,
     recalibrate_pd,
+    recalibrate_with_diagnostics,
     refit_same_predictors,
     refit_with_diagnostics,
     submodel_params,
@@ -189,3 +192,66 @@ def test_refit_is_identical_serially_and_in_parallel():
     np.testing.assert_array_equal(serial.p_holdout, parallel.p_holdout)
     assert serial.stability.equals(parallel.stability)
     assert serial.stability_summary == parallel.stability_summary
+
+
+def test_refit_keeps_the_model_and_grouping_and_round_trips(tmp_path):
+    train, holdout = _split_book()
+    result = refit_with_diagnostics(
+        train, holdout, ["x1", "x2", "cat"], "y", Gates(), date_col="date"
+    )
+    assert result.model is not None
+    assert result.grouping is not None
+    assert result.artifact is not None
+    assert result.artifact.kind == "refit"
+    scored = result.artifact.predict_proba(holdout[["x1", "x2", "cat"]])
+    np.testing.assert_allclose(scored, result.p_holdout)
+    directory = str(tmp_path / "refit_art")
+    result.save(directory)
+    reloaded = load_fitted_artifact(directory)
+    np.testing.assert_allclose(
+        reloaded.predict_proba(holdout[["x1", "x2", "cat"]]), result.p_holdout
+    )
+    assert reloaded.grouping is not None
+    assert reloaded.method == "logistic_woe"
+
+
+def test_refit_notes_differences_against_the_portfolio_grouping():
+    train, holdout = _split_book()
+    portfolio = BinningModel.fit(train[["x1", "x2", "cat"]], train["y"], Gates())
+    # A deliberately coarser segment grouping so the comparison has something to say.
+    coarse_gates = Gates(binning_max_bins=2, binning_min_bin_frac=0.3)
+    result = refit_with_diagnostics(
+        train,
+        holdout,
+        ["x1", "x2", "cat"],
+        "y",
+        coarse_gates,
+        date_col="date",
+        portfolio_grouping=portfolio,
+        pred_woe_map={"x1": "x1_woe"},
+    )
+    assert result.grouping is not None
+    assert result.grouping is not portfolio
+    assert not result.grouping_comparison.empty
+    assert set(result.grouping_comparison["feature"]) <= {"x1", "x2", "cat"}
+    notes = " ".join(result.grouping.specs["x1"].notes)
+    # Either the bins differ (notes get portfolio_diff) or they happen to align.
+    assert ("portfolio_diff:" in notes) or (result.grouping_comparison["kind"] == "aligned").any()
+
+
+def test_recalibration_saves_the_logistic_model(tmp_path):
+    rng = np.random.default_rng(3)
+    n = 4000
+    p_true = rng.uniform(0.01, 0.4, size=n)
+    y = rng.binomial(1, p_true)
+    p_biased = np.clip(p_true * 2.5, 1e-4, 0.99)
+    result = recalibrate_with_diagnostics(p_biased, y, p_biased, score_col="pd")
+    assert result.model is not None
+    np.testing.assert_allclose(result.p_holdout, result.artifact.predict_proba(p_biased))
+    directory = str(tmp_path / "recal_art")
+    result.save(directory)
+    reloaded = FittedModelArtifact.load(directory)
+    assert reloaded.kind == "recalibrate"
+    np.testing.assert_allclose(reloaded.predict_proba(p_biased), result.p_holdout)
+    assert abs(result.intercept) > 0 or abs(result.slope - 1.0) > 0
+

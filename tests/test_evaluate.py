@@ -143,3 +143,29 @@ def test_segments_with_no_rows_of_a_category_do_not_crash():
     result = evaluate_segments(df, cols, _gates())
     assert not result.decisions.empty
     assert np.isfinite(result.meta["overall_gini"])
+
+
+def test_evaluate_keeps_fitted_artifacts_and_grouping_notes(tmp_path):
+    df, cols = make_synthetic_book(n=9000, seed=3)
+    grouping = BinningModel.fit(
+        df.loc[df["obs"].eq(1), list(cols.cols_pred)],
+        df.loc[df["obs"].eq(1), cols.col_target],
+        _gates(),
+    )
+    result = evaluate_segments(df, cols, _gates(), grouping=grouping)
+    kinds = set(art.kind for art in result.fitted_artifacts)
+    assert "recalibrate" in kinds
+    assert "refit" in kinds
+    assert result.meta["pred_woe_map"] == {"x1": "x1_woe"}
+    assert not result.grouping_comparison.empty
+    assert result.grouping_comparison["significant"].any() or (
+        result.grouping_comparison["kind"] == "aligned"
+    ).any()
+    written = result.save_artifacts(str(tmp_path / "artifacts"))
+    assert written
+    from scorecard_segment_eval.refit import load_fitted_artifact
+
+    reloaded = load_fitted_artifact(written[0])
+    assert reloaded.kind in ("refit", "recalibrate")
+    assert reloaded.model is not None or reloaded.kind == "recalibrate"
+
