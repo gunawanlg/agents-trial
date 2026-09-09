@@ -107,40 +107,49 @@ def _fmt(value, precision):
     return ("%." + str(precision) + "g") % value
 
 
-def edge_labels(edges):
-    # type: (Sequence[float]) -> List[str]
-    """Human-readable, guaranteed-unique labels for ``(a, b]`` bins."""
+def edge_labels(edges, closed="right"):
+    # type: (Sequence[float], str) -> List[str]
+    """Human-readable, guaranteed-unique labels for numeric bins.
+
+    ``closed="right"`` (the historical default) uses ``(a, b]``.
+    ``closed="left"`` uses ``[a, b)``, matching SQL ``WHEN x < t`` chains.
+    """
+    left_closed = closed == "left"
     for precision in (6, 12):
         labels = []
         for i in range(len(edges) - 1):
             lo = _fmt(float(edges[i]), precision)
             hi = _fmt(float(edges[i + 1]), precision)
-            right = ")" if edges[i + 1] == np.inf else "]"
-            labels.append("(" + lo + ", " + hi + right)
+            left = "[" if left_closed else "("
+            right = ")" if left_closed or edges[i + 1] == np.inf else "]"
+            if (not left_closed) and edges[i + 1] == np.inf:
+                right = ")"
+            labels.append(left + lo + ", " + hi + right)
         if len(set(labels)) == len(labels):
             return labels
     return ["bin_%02d" % i for i in range(len(edges) - 1)]
 
 
-def assign_numeric_bins(values, edges, labels=None, missing_label=MISSING_LABEL):
-    # type: (Any, Sequence[float], Optional[Sequence[str]], str) -> np.ndarray
-    """Map numeric values onto ``edges`` using ``(a, b]`` semantics.
+def assign_numeric_bins(values, edges, labels=None, missing_label=MISSING_LABEL, closed="right"):
+    # type: (Any, Sequence[float], Optional[Sequence[str]], str, str) -> np.ndarray
+    """Map numeric values onto ``edges``.
 
-    Values outside the outer edges cannot occur because the outer edges are
-    infinite, so out-of-range handling reduces to clamping into the extreme
-    bins.  Missing values (including non-coercible ones) get ``missing_label``.
+    ``closed="right"`` uses ``(a, b]`` (``searchsorted`` side ``left``).
+    ``closed="left"`` uses ``[a, b)``, matching SQL ``x < t`` / ``x >= t``.
+    Missing values (including non-coercible ones) get ``missing_label``.
     """
     numeric = pd.to_numeric(pd.Series(values).reset_index(drop=True), errors="coerce")
     arr = numeric.to_numpy(dtype=float)
-    names = list(labels) if labels is not None else edge_labels(edges)
+    names = list(labels) if labels is not None else edge_labels(edges, closed=closed)
     inner = np.asarray(edges, dtype=float)[1:-1]
     out = np.empty(len(arr), dtype=object)
     isnan = ~np.isfinite(arr)
+    side = "left" if closed != "left" else "right"
     if len(inner):
-        idx = np.searchsorted(inner, np.where(isnan, 0.0, arr), side="left")
+        idx = np.searchsorted(inner, np.where(isnan, 0.0, arr), side=side)
     else:
         idx = np.zeros(len(arr), dtype=int)
-    idx = np.clip(idx, 0, len(names) - 1)
+    idx = np.clip(idx, 0, max(len(names) - 1, 0))
     for i in range(len(arr)):
         out[i] = missing_label if isnan[i] else names[int(idx[i])]
     return out
@@ -174,8 +183,13 @@ class BinSpec(object):
         monotonic=False,
         missing_label=MISSING_LABEL,
         notes=None,
+        closed="right",
+        impute=None,
+        transform=None,
+        output_name=None,
+        rules=None,
     ):
-        # type: (str, str, str, Optional[Sequence[float]], Optional[Dict[str, List[str]]], Optional[Sequence[str]], Optional[Dict[str, float]], Optional[Dict[str, float]], Optional[Dict[str, float]], float, bool, str, Optional[List[str]]) -> None
+        # type: (str, str, str, Optional[Sequence[float]], Optional[Dict[str, List[str]]], Optional[Sequence[str]], Optional[Dict[str, float]], Optional[Dict[str, float]], Optional[Dict[str, float]], float, bool, str, Optional[List[str]], str, Optional[float], Optional[str], Optional[str], Optional[Sequence[Dict[str, Any]]]) -> None
         self.feature = feature
         self.kind = kind
         self.method = method
@@ -189,13 +203,33 @@ class BinSpec(object):
         self.monotonic = bool(monotonic)
         self.missing_label = missing_label
         self.notes = list(notes or [])
+        self.closed = closed or "right"
+        self.impute = None if impute is None else float(impute)
+        self.transform = transform
+        self.output_name = output_name
+        self.rules = [dict(r) for r in (rules or [])]
 
     # -- application -------------------------------------------------------
     def assign(self, values):
         # type: (Any) -> np.ndarray
         """Return the bin label of every value."""
-        if self.kind == "numeric" and self.edges is not None:
-            return assign_numeric_bins(values, self.edges, self.labels, self.missing_label)
+        if self.kind == "logit" or self.transform == "logit":
+            return _assign_logit_labels(values, self.missing_label)
+        if self.rules:
+            return apply_sql_rules(values, self.rules, self.missing_label, return_woe=False)
+        if self.kind in ("numeric", "mixed") and self.edges is not None:
+            if self.kind == "mixed":
+                return _assign_mixed(
+                    values,
+                    self.edges,
+                    self.labels,
+                    self.groups,
+                    self.missing_label,
+                    self.closed,
+                )
+            return assign_numeric_bins(
+                values, self.edges, self.labels, self.missing_label, closed=self.closed
+            )
         levels = _as_str_levels(values, self.missing_label)
         lookup = {}
         for label, members in (self.groups or {}).items():
@@ -211,8 +245,12 @@ class BinSpec(object):
 
     def transform_woe(self, values):
         # type: (Any) -> np.ndarray
+        if self.kind == "logit" or self.transform == "logit":
+            return logit_transform(values, impute=self.impute)
+        if self.rules:
+            return apply_sql_rules(values, self.rules, self.missing_label, return_woe=True)
         labels = self.assign(values)
-        default = 0.0
+        default = float(self.woe.get(OTHER_LABEL, 0.0))
         return np.asarray([float(self.woe.get(label, default)) for label in labels], dtype=float)
 
     def bin_order(self):
@@ -241,6 +279,13 @@ class BinSpec(object):
             "monotonic": self.monotonic,
             "missing_label": self.missing_label,
             "notes": list(self.notes),
+            "missing_note": "; ".join(self.notes),
+            "closed": self.closed,
+            "impute": None if self.impute is None else _json_float(self.impute),
+            "else_woe": _json_float(self.woe[OTHER_LABEL]) if OTHER_LABEL in self.woe else None,
+            "transform": self.transform,
+            "output_name": self.output_name,
+            "rules": [_rule_to_dict(r) for r in self.rules],
         }
 
     @classmethod
@@ -263,6 +308,11 @@ class BinSpec(object):
             monotonic=bool(payload.get("monotonic", False)),
             missing_label=payload.get("missing_label", MISSING_LABEL),
             notes=payload.get("notes") or [],
+            closed=payload.get("closed") or "right",
+            impute=_optional_json_float(payload.get("impute")),
+            transform=payload.get("transform"),
+            output_name=payload.get("output_name"),
+            rules=payload.get("rules") or [],
         )
 
 
@@ -295,6 +345,124 @@ def _from_json_float(value):
     if value is None:
         return float("nan")
     return float(value)
+
+
+def _optional_json_float(value):
+    # type: (Any) -> Optional[float]
+    if value is None:
+        return None
+    return _from_json_float(value)
+
+
+def _rule_to_dict(rule):
+    # type: (Dict[str, Any]) -> Dict[str, Any]
+    out = dict(rule)
+    if "woe" in out:
+        out["woe"] = _json_float(out["woe"])
+    if "threshold" in out and out["threshold"] is not None:
+        out["threshold"] = _json_float(out["threshold"])
+    return out
+
+
+def logit_transform(values, impute=None, eps=1e-6):
+    # type: (Any, Optional[float], float) -> np.ndarray
+    """``log(p / (1-p))`` with optional imputation for null / invalid p."""
+    numeric = pd.to_numeric(pd.Series(values).reset_index(drop=True), errors="coerce")
+    arr = numeric.to_numpy(dtype=float)
+    clipped = np.clip(arr, eps, 1.0 - eps)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = np.log(clipped / (1.0 - clipped))
+    invalid = ~np.isfinite(arr) | (arr <= 0.0) | (arr >= 1.0) | ~np.isfinite(out)
+    if impute is None:
+        out[invalid] = np.nan
+    else:
+        out[invalid] = float(impute)
+    return out.astype(float)
+
+
+def _assign_logit_labels(values, missing_label=MISSING_LABEL):
+    # type: (Any, str) -> np.ndarray
+    numeric = pd.to_numeric(pd.Series(values).reset_index(drop=True), errors="coerce")
+    arr = numeric.to_numpy(dtype=float)
+    out = np.empty(len(arr), dtype=object)
+    for i in range(len(arr)):
+        out[i] = missing_label if not np.isfinite(arr[i]) else "logit"
+    return out
+
+
+def _assign_mixed(values, edges, labels, groups, missing_label, closed):
+    # type: (Any, Sequence[float], Sequence[str], Optional[Dict[str, List[str]]], str, str) -> np.ndarray
+    series = pd.Series(values).reset_index(drop=True)
+    lookup = {}
+    for label, members in (groups or {}).items():
+        for member in members:
+            lookup[str(member)] = label
+    numeric_labels = assign_numeric_bins(series, edges, labels, missing_label, closed=closed)
+    out = np.empty(len(series), dtype=object)
+    for i, value in enumerate(series.tolist()):
+        if value is None or (isinstance(value, float) and not np.isfinite(value)) or pd.isna(value):
+            out[i] = missing_label
+            continue
+        key = str(value)
+        if key in lookup:
+            out[i] = lookup[key]
+        elif numeric_labels[i] != missing_label:
+            out[i] = numeric_labels[i]
+        else:
+            out[i] = OTHER_LABEL
+    return out
+
+
+def apply_sql_rules(values, rules, missing_label=MISSING_LABEL, return_woe=False):
+    # type: (Any, Sequence[Dict[str, Any]], str, bool) -> np.ndarray
+    """Apply ordered SQL CASE WHEN rules; first match wins."""
+    series = pd.Series(values).reset_index(drop=True)
+    n = len(series)
+    matched = np.zeros(n, dtype=bool)
+    if return_woe:
+        out = np.zeros(n, dtype=float)  # type: Any
+    else:
+        out = np.empty(n, dtype=object)
+    numeric = pd.to_numeric(series, errors="coerce")
+    num = numeric.to_numpy(dtype=float)
+    is_null = series.isna().to_numpy()
+    str_values = series.map(lambda v: missing_label if pd.isna(v) else str(v)).to_numpy(dtype=object)
+    for rule in rules:
+        op = str(rule.get("op", "")).lower()
+        remaining = ~matched
+        hit = np.zeros(n, dtype=bool)
+        if op == "null":
+            hit = is_null & remaining
+        elif op == "eq":
+            want = str(rule.get("value", ""))
+            hit = (str_values == want) & (~is_null) & remaining
+        elif op in ("lt", "le", "gt", "ge"):
+            threshold = float(rule["threshold"])
+            finite = np.isfinite(num) & remaining
+            if op == "lt":
+                hit = finite & (num < threshold)
+            elif op == "le":
+                hit = finite & (num <= threshold)
+            elif op == "gt":
+                hit = finite & (num > threshold)
+            else:
+                hit = finite & (num >= threshold)
+        elif op == "else":
+            hit = remaining
+        else:
+            continue
+        if return_woe:
+            out[hit] = float(rule.get("woe", 0.0))
+        else:
+            label = rule.get("label") or (missing_label if op == "null" else OTHER_LABEL)
+            for i in np.where(hit)[0]:
+                out[i] = label
+        matched[hit] = True
+    if not return_woe:
+        for i in range(n):
+            if not matched[i]:
+                out[i] = missing_label if is_null[i] else OTHER_LABEL
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -667,6 +835,13 @@ class BinningModel(object):
         self.gates = gates or Gates()
         self.columns = list(self.specs.keys())  # type: List[str]
 
+    def closed(self, feature):
+        # type: (str) -> str
+        spec = self.specs.get(feature)
+        if spec is None:
+            return "right"
+        return spec.closed or "right"
+
     # -- fitting -----------------------------------------------------------
     @classmethod
     def fit(cls, X, y, gates=None, n_jobs=None):
@@ -700,18 +875,24 @@ class BinningModel(object):
     def transform(self, X):
         # type: (pd.DataFrame) -> np.ndarray
         """WoE matrix in ``self.columns`` order.  Unseen levels map to 0.0."""
+        mapped = self.transform_woe(X)
+        if mapped.empty:
+            return np.zeros((len(pd.DataFrame(X)), 0))
+        return mapped.to_numpy(dtype=float)
+
+    def transform_woe(self, X):
+        # type: (pd.DataFrame) -> pd.DataFrame
+        """Transformed columns (WoE / logit) in ``self.columns`` order."""
         frame = pd.DataFrame(X).reset_index(drop=True)
-        cols = []
+        data = {}
         for col in self.columns:
             if col not in self.specs:
                 continue
             if col in frame.columns:
-                cols.append(self.specs[col].transform_woe(frame[col]))
+                data[col] = self.specs[col].transform_woe(frame[col])
             else:
-                cols.append(np.zeros(len(frame), dtype=float))
-        if not cols:
-            return np.zeros((len(frame), 0))
-        return np.column_stack(cols)
+                data[col] = np.zeros(len(frame), dtype=float)
+        return pd.DataFrame(data, columns=[c for c in self.columns if c in data])
 
     def iv_table(self):
         # type: () -> pd.DataFrame
@@ -793,6 +974,12 @@ def load_grouping(path):
     # type: (str) -> BinningModel
     """Read a ``grouping.json`` definition."""
     return BinningModel.load(path)
+
+
+def grouping_from_dict(payload):
+    # type: (Dict[str, Any]) -> BinningModel
+    """Rebuild a grouping from a ``grouping.json`` payload."""
+    return BinningModel.from_dict(payload)
 
 
 # --------------------------------------------------------------------------
