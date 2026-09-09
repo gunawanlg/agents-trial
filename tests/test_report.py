@@ -120,6 +120,7 @@ def test_html_report_is_self_contained_and_has_every_section(result):
         "matched approval rate",
         "Characteristic drift and PSI method",
         "Refit performance",
+        "Segment vs portfolio grouping",
         "Predictor stability over vintages",
         "Vintage detail",
         "Gates used",
@@ -169,6 +170,7 @@ def test_markdown_report_covers_the_same_ground(result):
         "## 3. Matched approval-rate comparison",
         "## 4. Characteristic drift (PSI)",
         "## 5. Refit performance",
+        "## 5b. Segment vs portfolio grouping",
         "## 6. Predictor stability",
     ):
         assert heading in text

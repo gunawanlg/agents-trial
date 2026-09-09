@@ -14,19 +14,40 @@ Three upgrades over the original module (section A1 of the brief):
 3. **Stability-aware acceptance.**  :func:`refit_with_diagnostics` returns
    per-predictor vintage stability alongside the holdout predictions, so the
    caller can require *both* a performance gain and stability.
+
+Refit and recalibration both return a :class:`FittedModelArtifact` that holds
+the grouping (the WoE transformation) and the fitted estimator (logistic
+regression or XGBoost) so a later run can reproduce the scores.  A refit also
+compares the segment grouping against the original / portfolio grouping
+(``grouping.json`` or the grouping implied by ``cols_pred_woe``) and writes
+per-bin notes for any material difference.
 """
 
+import json
+import os
+import pickle
+import re
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 
-from scorecard_segment_eval.binning import BinningModel
-from scorecard_segment_eval.schema import Gates
+from scorecard_segment_eval.binning import (
+    BinningModel,
+    compare_groupings,
+    grouping_from_woe_columns,
+)
+from scorecard_segment_eval.schema import Gates, map_pred_to_woe
 from scorecard_segment_eval.stability import predictor_stability, stability_summary
+
+ARTIFACT_VERSION = 1
+MODEL_FILENAME = "model.pkl"
+GROUPING_FILENAME = "grouping.json"
+META_FILENAME = "meta.json"
+COMPARISON_FILENAME = "grouping_comparison.json"
 
 #: Absolute ceiling on sub-model depth; callers may lower it, never raise it.
 MAX_SUBMODEL_DEPTH = 3
@@ -187,6 +208,171 @@ def fit_submodel(X_woe, y, gates=None, xgb_params=None):
     return model
 
 
+def _safe_path_token(value):
+    # type: (Any) -> str
+    text = "none" if value is None else str(value)
+    text = text.strip() or "unnamed"
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", text)[:80]
+
+
+def _ensure_dir(path):
+    # type: (str) -> str
+    directory = os.path.abspath(path)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    return directory
+
+
+@dataclass
+class FittedModelArtifact:
+    """Grouping + estimator bundle that can score a later sample.
+
+    ``kind`` is ``"refit"`` (new WoE bins + LR/XGBoost) or ``"recalibrate"``
+    (two-parameter logistic rescale of an existing PD).  :meth:`save` writes
+    a directory containing ``grouping.json``, ``model.pkl`` and ``meta.json``
+    so the user can reload the exact transformation and model.
+    """
+
+    kind: str
+    method: str
+    grouping: Optional[BinningModel] = None
+    model: Any = None
+    feature_names: List[str] = field(default_factory=list)
+    pred_woe_map: Dict[str, str] = field(default_factory=dict)
+    coefficients: Dict[str, float] = field(default_factory=dict)
+    grouping_comparison: pd.DataFrame = field(default_factory=pd.DataFrame)
+    segment_col: Optional[str] = None
+    segment_value: Optional[str] = None
+    score_col: Optional[str] = None
+    messages: List[str] = field(default_factory=list)
+
+    def predict_proba(self, X, score=None):
+        # type: (Any, Any) -> np.ndarray
+        """Reproduce scores.  Recalibration consumes a PD; refit consumes raw X."""
+        if self.model is None:
+            raise ValueError("FittedModelArtifact has no model to score with")
+        if self.kind == "recalibrate":
+            if score is None:
+                if isinstance(X, pd.DataFrame) and self.score_col and self.score_col in X.columns:
+                    score = X[self.score_col]
+                else:
+                    score = X
+            z = _logit(np.asarray(score, dtype=float)).reshape(-1, 1)
+            return np.asarray(self.model.predict_proba(z)[:, 1], dtype=float)
+        if self.grouping is None:
+            raise ValueError("refit artifact is missing its WoE grouping")
+        if isinstance(X, pd.DataFrame):
+            cols = [c for c in self.feature_names if c in X.columns] or self.feature_names
+            matrix = self.grouping.transform(X[cols] if cols else X)
+        else:
+            matrix = np.asarray(X, dtype=float)
+            if self.grouping is not None and matrix.ndim == 2 and matrix.shape[1] != len(self.grouping.columns):
+                matrix = self.grouping.transform(pd.DataFrame(matrix, columns=list(self.feature_names)))
+        return np.asarray(self.model.predict_proba(matrix)[:, 1], dtype=float)
+
+    def to_meta(self):
+        # type: () -> Dict[str, Any]
+        comparison = []
+        if self.grouping_comparison is not None and not self.grouping_comparison.empty:
+            comparison = json.loads(self.grouping_comparison.to_json(orient="records"))
+        return {
+            "version": ARTIFACT_VERSION,
+            "kind": self.kind,
+            "method": self.method,
+            "feature_names": list(self.feature_names),
+            "pred_woe_map": dict(self.pred_woe_map),
+            "coefficients": dict(self.coefficients),
+            "segment_col": self.segment_col,
+            "segment_value": None if self.segment_value is None else str(self.segment_value),
+            "score_col": self.score_col,
+            "messages": list(self.messages),
+            "has_grouping": self.grouping is not None,
+            "has_model": self.model is not None,
+            "grouping_comparison": comparison,
+        }
+
+    def save(self, directory):
+        # type: (str) -> str
+        """Write the grouping, the estimator and metadata into ``directory``."""
+        directory = _ensure_dir(directory)
+        meta = self.to_meta()
+        with open(os.path.join(directory, META_FILENAME), "w") as handle:
+            json.dump(meta, handle, indent=2, sort_keys=True)
+        if self.grouping is not None:
+            self.grouping.save(os.path.join(directory, GROUPING_FILENAME))
+        if self.model is not None:
+            with open(os.path.join(directory, MODEL_FILENAME), "wb") as handle:
+                pickle.dump(self.model, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        if self.grouping_comparison is not None and not self.grouping_comparison.empty:
+            records = json.loads(self.grouping_comparison.to_json(orient="records"))
+            with open(os.path.join(directory, COMPARISON_FILENAME), "w") as handle:
+                json.dump(records, handle, indent=2)
+        return directory
+
+    @classmethod
+    def load(cls, directory):
+        # type: (str) -> "FittedModelArtifact"
+        directory = os.path.abspath(directory)
+        with open(os.path.join(directory, META_FILENAME), "r") as handle:
+            meta = json.load(handle)
+        grouping_path = os.path.join(directory, GROUPING_FILENAME)
+        grouping = BinningModel.load(grouping_path) if os.path.isfile(grouping_path) else None
+        model_path = os.path.join(directory, MODEL_FILENAME)
+        model = None
+        if os.path.isfile(model_path):
+            with open(model_path, "rb") as handle:
+                model = pickle.load(handle)
+        comparison = pd.DataFrame()
+        comparison_path = os.path.join(directory, COMPARISON_FILENAME)
+        if os.path.isfile(comparison_path):
+            with open(comparison_path, "r") as handle:
+                comparison = pd.DataFrame(json.load(handle))
+        elif meta.get("grouping_comparison"):
+            comparison = pd.DataFrame(meta["grouping_comparison"])
+        return cls(
+            kind=str(meta.get("kind", "refit")),
+            method=str(meta.get("method", "unknown")),
+            grouping=grouping,
+            model=model,
+            feature_names=list(meta.get("feature_names") or []),
+            pred_woe_map=dict(meta.get("pred_woe_map") or {}),
+            coefficients=dict(meta.get("coefficients") or {}),
+            grouping_comparison=comparison,
+            segment_col=meta.get("segment_col"),
+            segment_value=meta.get("segment_value"),
+            score_col=meta.get("score_col"),
+            messages=list(meta.get("messages") or []),
+        )
+
+
+def save_fitted_artifact(artifact, directory):
+    # type: (FittedModelArtifact, str) -> str
+    """Write one :class:`FittedModelArtifact` directory."""
+    return artifact.save(directory)
+
+
+def load_fitted_artifact(directory):
+    # type: (str) -> FittedModelArtifact
+    """Read a directory written by :func:`save_fitted_artifact`."""
+    return FittedModelArtifact.load(directory)
+
+
+def save_fitted_artifacts(artifacts, directory):
+    # type: (Sequence[FittedModelArtifact], str) -> List[str]
+    """Write every artifact under ``directory/{segment}/{value}/{kind}``."""
+    directory = _ensure_dir(directory)
+    written = []  # type: List[str]
+    for artifact in artifacts or ():
+        sub = os.path.join(
+            directory,
+            _safe_path_token(artifact.segment_col or "segment"),
+            _safe_path_token(artifact.segment_value),
+            _safe_path_token(artifact.kind),
+        )
+        written.append(artifact.save(sub))
+    return written
+
+
 @dataclass
 class RefitResult:
     """Everything a caller needs to accept or reject a refit."""
@@ -194,10 +380,14 @@ class RefitResult:
     p_holdout: np.ndarray
     method: str
     grouping: Optional[BinningModel] = None
+    model: Any = None
     stability: pd.DataFrame = field(default_factory=pd.DataFrame)
     stability_summary: Dict[str, Any] = field(default_factory=dict)
     coefficients: Dict[str, float] = field(default_factory=dict)
     messages: List[str] = field(default_factory=list)
+    grouping_comparison: pd.DataFrame = field(default_factory=pd.DataFrame)
+    pred_woe_map: Dict[str, str] = field(default_factory=dict)
+    artifact: Optional[FittedModelArtifact] = None
 
     def stability_pass(self):
         # type: () -> bool
@@ -206,6 +396,64 @@ class RefitResult:
     def stability_score(self):
         # type: () -> float
         return float(self.stability_summary.get("stability_score", float("nan")))
+
+    def save(self, directory):
+        # type: (str) -> str
+        artifact = self.artifact or self.to_artifact()
+        return artifact.save(directory)
+
+    def to_artifact(self, segment_col=None, segment_value=None):
+        # type: (Optional[str], Optional[str]) -> FittedModelArtifact
+        if self.artifact is not None:
+            if segment_col is not None:
+                self.artifact.segment_col = segment_col
+            if segment_value is not None:
+                self.artifact.segment_value = None if segment_value is None else str(segment_value)
+            return self.artifact
+        return FittedModelArtifact(
+            kind="refit",
+            method=self.method,
+            grouping=self.grouping,
+            model=self.model,
+            feature_names=list(self.grouping.columns) if self.grouping is not None else [],
+            pred_woe_map=dict(self.pred_woe_map),
+            coefficients=dict(self.coefficients),
+            grouping_comparison=self.grouping_comparison,
+            segment_col=segment_col,
+            segment_value=None if segment_value is None else str(segment_value),
+            messages=list(self.messages),
+        )
+
+
+def _resolve_portfolio_grouping(
+    portfolio_grouping,
+    pred_woe_map,
+    portfolio_frame,
+    pred_cols,
+    target_col,
+    gates,
+    n_jobs,
+):
+    # type: (Optional[BinningModel], Dict[str, str], Optional[pd.DataFrame], Sequence[str], str, Gates, Optional[int]) -> Tuple[Optional[BinningModel], List[str]]
+    """Pick the original / portfolio grouping to compare a segment refit against."""
+    messages = []  # type: List[str]
+    if portfolio_grouping is not None:
+        return portfolio_grouping, messages
+    if pred_woe_map and portfolio_frame is not None:
+        reconstructed = grouping_from_woe_columns(portfolio_frame, pred_woe_map, gates=gates)
+        if reconstructed is not None:
+            messages.append("portfolio_grouping_from_woe_columns")
+            return reconstructed, messages
+        messages.append("cols_pred_woe_not_discrete_grouping")
+    if portfolio_frame is not None and pred_cols and target_col in getattr(portfolio_frame, "columns", []):
+        usable = [c for c in pred_cols if c in portfolio_frame.columns]
+        if usable:
+            fitted = BinningModel.fit(
+                portfolio_frame[usable], portfolio_frame[target_col], gates=gates, n_jobs=n_jobs
+            )
+            messages.append("portfolio_grouping_fitted_on_reference_frame")
+            return fitted, messages
+    return None, messages
 
 
 def refit_with_diagnostics(
@@ -219,23 +467,40 @@ def refit_with_diagnostics(
     date_col=None,
     grouping=None,
     n_jobs=None,
+    portfolio_grouping=None,
+    pred_woe_map=None,
+    portfolio_frame=None,
+    cols_pred_woe=None,
+    segment_col=None,
+    segment_value=None,
 ):
-    # type: (pd.DataFrame, pd.DataFrame, Sequence[str], str, Optional[Gates], bool, Optional[Dict[str, Any]], Optional[str], Optional[BinningModel], Optional[int]) -> RefitResult
+    # type: (pd.DataFrame, pd.DataFrame, Sequence[str], str, Optional[Gates], bool, Optional[Dict[str, Any]], Optional[str], Optional[BinningModel], Optional[int], Optional[BinningModel], Optional[Dict[str, str]], Optional[pd.DataFrame], Optional[Sequence[str]], Optional[str], Any) -> RefitResult
     """Refit on ``train``, score ``holdout``, and diagnose predictor stability.
 
     The grouping is fitted on the training rows only (or reused when supplied),
     so the holdout stays untouched.  Stability is measured on the training rows
     as well, because acceptance has to be decidable before the refit is used.
+
+    When ``cols_pred_woe`` or ``pred_woe_map`` is supplied, the segment
+    grouping is compared to the original / portfolio grouping (``portfolio_grouping``,
+    else reconstructed from the WoE columns, else fitted on ``portfolio_frame``)
+    and per-bin notes are attached to the saved grouping.
     """
     gates = gates or Gates()
     pred_cols = [c for c in pred_cols if c in train.columns and c in holdout.columns]
     messages = []  # type: List[str]
+    mapping = dict(pred_woe_map or {})
+    if not mapping:
+        mapping = map_pred_to_woe(pred_cols, cols_pred_woe)
     if not pred_cols:
-        return RefitResult(
+        empty = RefitResult(
             p_holdout=np.full(len(holdout), float("nan")),
             method="none",
             messages=["no_usable_predictors"],
+            pred_woe_map=mapping,
         )
+        empty.artifact = empty.to_artifact(segment_col=segment_col, segment_value=segment_value)
+        return empty
 
     y_train = train[target_col].to_numpy(dtype=int)
     if grouping is None:
@@ -248,12 +513,14 @@ def refit_with_diagnostics(
     method = "logistic_woe"
     coefficients = {}  # type: Dict[str, float]
     p_holdout = None  # type: Optional[np.ndarray]
+    model = None  # type: Any
     if submodel:
         booster = fit_submodel(x_train, y_train, gates=gates, xgb_params=xgb_params)
         if booster is None:
             messages.append("xgboost_unavailable_fallback_logistic")
         else:
             method = "xgboost_submodel"
+            model = booster
             p_holdout = np.asarray(booster.predict_proba(x_holdout)[:, 1], dtype=float)
             importances = getattr(booster, "feature_importances_", None)
             if importances is not None:
@@ -266,6 +533,21 @@ def refit_with_diagnostics(
         coefficients = dict((col, float(val)) for col, val in zip(grouping.columns, model.coef_[0]))
         coefficients["__intercept__"] = float(model.intercept_[0])
 
+    reference = portfolio_frame
+    resolved_portfolio, port_messages = _resolve_portfolio_grouping(
+        portfolio_grouping,
+        mapping,
+        reference,
+        pred_cols,
+        target_col,
+        gates,
+        n_jobs,
+    )
+    messages.extend(port_messages)
+    comparison = compare_groupings(
+        grouping, resolved_portfolio, pred_woe_map=mapping, gates=gates
+    )
+
     stability = predictor_stability(
         train,
         pred_cols,
@@ -276,15 +558,20 @@ def refit_with_diagnostics(
         n_jobs=n_jobs,
     )
     summary = stability_summary(stability, gates=gates)
-    return RefitResult(
+    result = RefitResult(
         p_holdout=p_holdout,
         method=method,
         grouping=grouping,
+        model=model,
         stability=stability,
         stability_summary=summary,
         coefficients=coefficients,
         messages=messages,
+        grouping_comparison=comparison,
+        pred_woe_map=mapping,
     )
+    result.artifact = result.to_artifact(segment_col=segment_col, segment_value=segment_value)
+    return result
 
 
 def refit_same_predictors(
@@ -298,8 +585,12 @@ def refit_same_predictors(
     date_col=None,
     grouping=None,
     n_jobs=None,
+    portfolio_grouping=None,
+    pred_woe_map=None,
+    portfolio_frame=None,
+    cols_pred_woe=None,
 ):
-    # type: (pd.DataFrame, pd.DataFrame, Sequence[str], str, Gates, bool, Optional[Dict[str, Any]], Optional[str], Optional[BinningModel], Optional[int]) -> np.ndarray
+    # type: (pd.DataFrame, pd.DataFrame, Sequence[str], str, Gates, bool, Optional[Dict[str, Any]], Optional[str], Optional[BinningModel], Optional[int], Optional[BinningModel], Optional[Dict[str, str]], Optional[pd.DataFrame], Optional[Sequence[str]]) -> np.ndarray
     """Holdout PDs from a same-predictor refit (unchanged return contract)."""
     result = refit_with_diagnostics(
         train,
@@ -312,21 +603,104 @@ def refit_same_predictors(
         date_col=date_col,
         grouping=grouping,
         n_jobs=n_jobs,
+        portfolio_grouping=portfolio_grouping,
+        pred_woe_map=pred_woe_map,
+        portfolio_frame=portfolio_frame,
+        cols_pred_woe=cols_pred_woe,
     )
     return result.p_holdout
+
+
+@dataclass
+class RecalibrateResult:
+    """Two-parameter PD rescale plus the fitted estimator (and optional grouping)."""
+
+    p_holdout: np.ndarray
+    model: Any = None
+    intercept: float = float("nan")
+    slope: float = float("nan")
+    grouping: Optional[BinningModel] = None
+    artifact: Optional[FittedModelArtifact] = None
+    messages: List[str] = field(default_factory=list)
+
+    def save(self, directory):
+        # type: (str) -> str
+        artifact = self.artifact or self.to_artifact()
+        return artifact.save(directory)
+
+    def to_artifact(self, segment_col=None, segment_value=None, score_col=None):
+        # type: (Optional[str], Optional[str], Optional[str]) -> FittedModelArtifact
+        if self.artifact is not None:
+            if segment_col is not None:
+                self.artifact.segment_col = segment_col
+            if segment_value is not None:
+                self.artifact.segment_value = None if segment_value is None else str(segment_value)
+            if score_col is not None:
+                self.artifact.score_col = score_col
+            return self.artifact
+        coefficients = {"__intercept__": float(self.intercept), "logit_pd": float(self.slope)}
+        return FittedModelArtifact(
+            kind="recalibrate",
+            method="logistic_pd",
+            grouping=self.grouping,
+            model=self.model,
+            feature_names=["logit_pd"],
+            coefficients=coefficients,
+            segment_col=segment_col,
+            segment_value=None if segment_value is None else str(segment_value),
+            score_col=score_col,
+            messages=list(self.messages),
+        )
+
+
+def recalibrate_with_diagnostics(
+    p_train,
+    y_train,
+    p_holdout,
+    grouping=None,
+    score_col=None,
+    segment_col=None,
+    segment_value=None,
+):
+    # type: (Any, Any, Any, Optional[BinningModel], Optional[str], Optional[str], Any) -> RecalibrateResult
+    """Two-parameter logistic rescale, returning the fitted model for reuse."""
+    z_tr = _logit(np.asarray(p_train, dtype=float)).reshape(-1, 1)
+    y = np.asarray(y_train, dtype=int)
+    p_ho = np.asarray(p_holdout, dtype=float)
+    messages = []  # type: List[str]
+    if y.min() == y.max():
+        clipped = np.clip(p_ho, 1e-6, 1.0 - 1e-6)
+        result = RecalibrateResult(
+            p_holdout=clipped,
+            grouping=grouping,
+            messages=["one_class_train_passthrough"],
+        )
+        result.artifact = result.to_artifact(
+            segment_col=segment_col, segment_value=segment_value, score_col=score_col
+        )
+        return result
+    model = LogisticRegression(C=1e6, solver="lbfgs", max_iter=1000)
+    model.fit(z_tr, y)
+    z_ho = _logit(p_ho).reshape(-1, 1)
+    scored = np.asarray(model.predict_proba(z_ho)[:, 1], dtype=float)
+    result = RecalibrateResult(
+        p_holdout=scored,
+        model=model,
+        intercept=float(model.intercept_[0]),
+        slope=float(model.coef_[0][0]),
+        grouping=grouping,
+        messages=messages,
+    )
+    result.artifact = result.to_artifact(
+        segment_col=segment_col, segment_value=segment_value, score_col=score_col
+    )
+    return result
 
 
 def recalibrate_pd(p_train, y_train, p_holdout):
     # type: (Any, Any, Any) -> np.ndarray
     """Two-parameter logistic rescale: ``logit(p*) = a + b * logit(p)``."""
-    z_tr = _logit(np.asarray(p_train, dtype=float)).reshape(-1, 1)
-    y = np.asarray(y_train, dtype=int)
-    if y.min() == y.max():
-        return np.clip(np.asarray(p_holdout, dtype=float), 1e-6, 1.0 - 1e-6)
-    model = LogisticRegression(C=1e6, solver="lbfgs", max_iter=1000)
-    model.fit(z_tr, y)
-    z_ho = _logit(np.asarray(p_holdout, dtype=float)).reshape(-1, 1)
-    return model.predict_proba(z_ho)[:, 1]
+    return recalibrate_with_diagnostics(p_train, y_train, p_holdout).p_holdout
 
 
 def apply_recalibrate_fn(p_train, y_train, p_holdout):

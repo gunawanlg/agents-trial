@@ -671,9 +671,15 @@ def _xgboost_available():
     return True
 
 
-# --------------------------------------------------------------------------
-# Presentation and interactive confirmation
-# --------------------------------------------------------------------------
+def _format_pred_woe_map(mapping, cols_pred):
+    # type: (Dict[str, str], Sequence[str]) -> str
+    if not cols_pred and not mapping:
+        return ""
+    parts = []
+    for pred in list(cols_pred or ()):
+        woe = mapping.get(pred)
+        parts.append("%s -> %s" % (pred, woe if woe else "(none)"))
+    return "; ".join(parts)
 def render_metadata_summary(meta):
     # type: (ResolvedMetadata) -> str
     """Plain-text summary of the resolved metadata, provenance and warnings."""
@@ -689,12 +695,15 @@ def render_metadata_summary(meta):
         ("cols_segment", cols.cols_segment),
         ("cols_pred", cols.cols_pred),
         ("cols_pred_woe", cols.cols_pred_woe),
+        ("pred_woe_map", _format_pred_woe_map(cols.pred_woe_map(), cols.cols_pred)),
         ("cols_pred_used", cols.cols_pred_used),
         ("grouping_path", meta.grouping_path),
         ("portfolio", meta.portfolio),
     ]
     for name, value in fields:
         source = meta.sources.get(name, "not_set")
+        if name == "pred_woe_map":
+            source = "derived" if cols.cols_pred_woe and cols.cols_pred else source
         shown = ", ".join(str(v) for v in value) if isinstance(value, list) else str(value)
         lines.append("  %-16s %-40s [%s]" % (name + ":", shown if shown else "-", source))
     if meta.warnings:

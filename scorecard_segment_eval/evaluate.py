@@ -25,7 +25,12 @@ from scorecard_segment_eval.metrics import (
 )
 from scorecard_segment_eval.parallel import map_jobs, ordered_concat
 from scorecard_segment_eval.population import fantomas_mask, observable_mask, time_holdout_mask
-from scorecard_segment_eval.refit import recalibrate_pd, refit_with_diagnostics
+from scorecard_segment_eval.refit import (
+    FittedModelArtifact,
+    recalibrate_with_diagnostics,
+    refit_with_diagnostics,
+    save_fitted_artifacts,
+)
 from scorecard_segment_eval.schema import Gates, ScorecardColumns
 from scorecard_segment_eval.stability import predictor_stability
 
@@ -51,7 +56,14 @@ class SegmentEvalResult:
     characteristics: pd.DataFrame
     vintage: pd.DataFrame
     stability: pd.DataFrame = field(default_factory=pd.DataFrame)
+    grouping_comparison: pd.DataFrame = field(default_factory=pd.DataFrame)
+    fitted_artifacts: List[FittedModelArtifact] = field(default_factory=list)
     meta: Dict[str, Any] = field(default_factory=dict)
+
+    def save_artifacts(self, directory):
+        # type: (str) -> List[str]
+        """Persist every recalibrate / refit grouping and estimator."""
+        return save_fitted_artifacts(self.fitted_artifacts, directory)
 
 
 def _vintage_ratio(obs, cols):
@@ -149,17 +161,22 @@ def _run_holdout_models(
     submodel=False,
     xgb_params=None,
     n_jobs=None,
+    obs_all=None,
+    segment_col=None,
+    segment_value=None,
 ):
-    # type: (pd.DataFrame, ScorecardColumns, Gates, bool, bool, Optional[BinningModel], bool, Optional[Dict[str, Any]], Optional[int]) -> Tuple[Dict[str, Any], pd.DataFrame]
+    # type: (pd.DataFrame, ScorecardColumns, Gates, bool, bool, Optional[BinningModel], bool, Optional[Dict[str, Any]], Optional[int], Optional[pd.DataFrame], Optional[str], Any) -> Tuple[Dict[str, Any], pd.DataFrame, List[FittedModelArtifact], pd.DataFrame]
     out = _empty_holdout_row()
     stability_table = pd.DataFrame()
+    artifacts = []  # type: List[FittedModelArtifact]
+    grouping_notes = pd.DataFrame()
     if len(obs_seg) < 40 or cols.col_date is None or cols.col_date not in obs_seg.columns:
-        return out, stability_table
+        return out, stability_table, artifacts, grouping_notes
     ho = time_holdout_mask(obs_seg[cols.col_date], gates.holdout_frac)
     train = obs_seg.loc[~ho]
     holdout = obs_seg.loc[ho]
     if train[cols.col_target].sum() < 5 or holdout[cols.col_target].sum() < 5:
-        return out, stability_table
+        return out, stability_table, artifacts, grouping_notes
     y = holdout[cols.col_target].to_numpy(dtype=float)
     p_pooled = holdout[cols.col_score].to_numpy(dtype=float)
     out["n_holdout"] = float(len(holdout))
@@ -168,15 +185,25 @@ def _run_holdout_models(
     out["brier_pooled"] = brier(y, p_pooled)
     out["logloss_pooled"] = logloss(y, p_pooled)
     if do_recal:
-        p_re = recalibrate_pd(
-            train[cols.col_score].to_numpy(), train[cols.col_target].to_numpy(), p_pooled
+        recal = recalibrate_with_diagnostics(
+            train[cols.col_score].to_numpy(),
+            train[cols.col_target].to_numpy(),
+            p_pooled,
+            grouping=grouping,
+            score_col=cols.col_score,
+            segment_col=segment_col,
+            segment_value=segment_value,
         )
+        p_re = recal.p_holdout
         out["gini_recal"] = gini(y, p_re)
         out["brier_recal"] = brier(y, p_re)
         out["logloss_recal"] = logloss(y, p_re)
+        if recal.artifact is not None:
+            artifacts.append(recal.artifact)
     if do_refit and cols.cols_pred:
         missing = [c for c in cols.cols_pred if c not in obs_seg.columns]
         if not missing:
+            mapping = cols.pred_woe_map()
             refit = refit_with_diagnostics(
                 train,
                 holdout,
@@ -186,8 +213,14 @@ def _run_holdout_models(
                 submodel=submodel,
                 xgb_params=xgb_params,
                 date_col=cols.col_date,
-                grouping=grouping,
+                grouping=None,
                 n_jobs=n_jobs,
+                portfolio_grouping=grouping,
+                pred_woe_map=mapping,
+                portfolio_frame=obs_all if obs_all is not None else obs_seg,
+                cols_pred_woe=list(cols.cols_pred_woe or []),
+                segment_col=segment_col,
+                segment_value=segment_value,
             )
             delta = bootstrap_delta_gini(
                 y,
@@ -215,7 +248,10 @@ def _run_holdout_models(
                 if key in refit.stability_summary:
                     out[key] = refit.stability_summary[key]
             stability_table = refit.stability
-    return out, stability_table
+            grouping_notes = refit.grouping_comparison
+            if refit.artifact is not None:
+                artifacts.append(refit.artifact)
+    return out, stability_table, artifacts, grouping_notes
 
 
 def _matched_ar_for_segment(obs_seg, obs_all, cols, gates):
@@ -317,7 +353,7 @@ def _evaluate_one_segment(task):
 
     do_recal = q1 == "WEAK" and "rank_order" not in failed and "calibration" in failed
     do_refit = (q1 == "WEAK" and "rank_order" in failed) or divergent
-    hold, stability_table = _run_holdout_models(
+    hold, stability_table, artifacts, grouping_notes = _run_holdout_models(
         obs,
         cols,
         gates,
@@ -327,6 +363,9 @@ def _evaluate_one_segment(task):
         submodel=submodel,
         xgb_params=xgb_params,
         n_jobs=n_jobs,
+        obs_all=obs_all,
+        segment_col=seg_col,
+        segment_value=value,
     )
     hold.update(
         {
@@ -335,6 +374,8 @@ def _evaluate_one_segment(task):
             "shape_divergent": divergent,
         }
     )
+    if not grouping_notes.empty:
+        grouping_notes = grouping_notes.assign(segment_col=seg_col, segment_value=str(value))
     if not stability_table.empty:
         stability_table = stability_table.assign(segment_col=seg_col, segment_value=str(value))
 
@@ -403,6 +444,8 @@ def _evaluate_one_segment(task):
         "characteristics": char,
         "vintage": vint,
         "stability": stability_table,
+        "fitted_artifacts": artifacts,
+        "grouping_comparison": grouping_notes,
     }
 
 
@@ -486,6 +529,8 @@ def evaluate_segments(
     char_frames = []  # type: List[pd.DataFrame]
     vintage_frames = []  # type: List[pd.DataFrame]
     stability_frames = []  # type: List[pd.DataFrame]
+    grouping_frames = []  # type: List[pd.DataFrame]
+    artifacts = []  # type: List[FittedModelArtifact]
     for out in outputs:
         summary_rows.extend(out["summary_rows"])
         decision_rows.append(out["decision"])
@@ -493,6 +538,8 @@ def evaluate_segments(
         char_frames.append(out["characteristics"])
         vintage_frames.append(out["vintage"])
         stability_frames.append(out["stability"])
+        grouping_frames.append(out.get("grouping_comparison", pd.DataFrame()))
+        artifacts.extend(out.get("fitted_artifacts") or [])
 
     overall_stability = _overall_stability(df, obs_all, cols, gates, grouping, jobs)
     if not overall_stability.empty:
@@ -505,6 +552,8 @@ def evaluate_segments(
         "n_jobs": jobs,
         "submodel": bool(submodel),
         "grouping_supplied": grouping is not None,
+        "pred_woe_map": cols.pred_woe_map(),
+        "n_fitted_artifacts": len(artifacts),
         "gates": dict(gates.__dict__),
         "columns": cols.as_dict(),
     }
@@ -515,6 +564,8 @@ def evaluate_segments(
         characteristics=ordered_concat(char_frames),
         vintage=ordered_concat(vintage_frames),
         stability=ordered_concat(stability_frames),
+        grouping_comparison=ordered_concat(grouping_frames),
+        fitted_artifacts=artifacts,
         meta=meta,
     )
 

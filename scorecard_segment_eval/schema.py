@@ -5,7 +5,7 @@ Python 3.6 compatibility: annotations use ``typing`` generics only, and the
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 
 @dataclass(frozen=True)
@@ -67,6 +67,120 @@ class ScorecardColumns:
             kwargs[key] = value
         return cls(**kwargs)  # type: ignore[arg-type]
 
+    def pred_woe_map(self):
+        # type: () -> Dict[str, str]
+        """Map each raw predictor onto its supplied WoE column, when one exists."""
+        return map_pred_to_woe(self.cols_pred, self.cols_pred_woe)
+
+
+#: Affixes used to recognise a Weight-of-Evidence column name.
+_WOE_SUFFIXES = ("_woe", "_woes")
+_WOE_PREFIXES = ("woe_", "woe")
+
+
+def _strip_woe_affix(name):
+    # type: (str) -> str
+    text = str(name).strip()
+    lowered = text.lower()
+    for suffix in _WOE_SUFFIXES:
+        if lowered.endswith(suffix) and len(lowered) > len(suffix):
+            return text[: len(text) - len(suffix)]
+    for prefix in _WOE_PREFIXES:
+        if lowered.startswith(prefix) and len(lowered) > len(prefix):
+            rest = text[len(prefix) :]
+            if rest.startswith("_"):
+                rest = rest[1:]
+            return rest
+    return text
+
+
+def _norm(name):
+    # type: (str) -> str
+    return str(name).strip().lower()
+
+
+def map_pred_to_woe(cols_pred, cols_pred_woe):
+    # type: (Optional[Sequence[str]], Optional[Sequence[str]]) -> Dict[str, str]
+    """Map ``cols_pred`` onto ``cols_pred_woe``.
+
+    The usual convention is a ``_woe`` suffix (``predA`` → ``predA_woe``).
+    When that exact name is absent, the mapper still pairs a predictor with a
+    unique remaining WoE column by prefix, case-insensitive name, or by
+    stripping a ``woe_`` / ``_woe`` affix.  Each WoE column is used at most
+    once, in ``cols_pred`` order.  Predictors with no counterpart are omitted.
+
+    Example::
+
+        map_pred_to_woe(['predA', 'predB'], ['predA_woe'])
+        # {'predA': 'predA_woe'}
+    """
+    preds = [str(c) for c in (cols_pred or ()) if str(c)]
+    woes = [str(c) for c in (cols_pred_woe or ()) if str(c)]
+    if not preds or not woes:
+        return {}
+
+    remaining = list(woes)
+    mapping = {}  # type: Dict[str, str]
+
+    def _take(candidate):
+        # type: (Optional[str]) -> Optional[str]
+        if candidate is None or candidate not in remaining:
+            return None
+        remaining.remove(candidate)
+        return candidate
+
+    def _find_ci(target):
+        # type: (str) -> Optional[str]
+        needle = _norm(target)
+        hits = [w for w in remaining if _norm(w) == needle]
+        return hits[0] if hits else None
+
+    for pred in preds:
+        chosen = None  # type: Optional[str]
+        # 1. Exact name: the predictor *is* already the WoE column.
+        chosen = _take(pred) if pred in remaining else None
+        # 2. Conventional suffix / prefix, preserving the caller's spelling.
+        if chosen is None:
+            for candidate in (pred + "_woe", pred + "_WoE", pred + "_WOE", "woe_" + pred, "WOE_" + pred):
+                chosen = _take(candidate)
+                if chosen is not None:
+                    break
+        # 3. Case-insensitive exact, then conventional affix.
+        if chosen is None:
+            chosen = _take(_find_ci(pred))
+        if chosen is None:
+            for candidate in (pred + "_woe", "woe_" + pred):
+                chosen = _take(_find_ci(candidate))
+                if chosen is not None:
+                    break
+        # 4. Unique remaining WoE column whose affix-stripped name matches.
+        if chosen is None:
+            want = _norm(_strip_woe_affix(pred))
+            hits = [w for w in remaining if _norm(_strip_woe_affix(w)) == want]
+            if len(hits) == 1:
+                chosen = _take(hits[0])
+        # 5. Unique remaining WoE column that starts with the predictor
+        #    (predA → predA_woe even if other affixes were used).
+        if chosen is None:
+            needle = _norm(pred)
+            hits = [w for w in remaining if _norm(w).startswith(needle) and _norm(w) != needle]
+            if len(hits) == 1:
+                chosen = _take(hits[0])
+        # 6. Unique remaining WoE column whose stripped name starts with the
+        #    predictor, or vice versa, when that is unambiguous.
+        if chosen is None:
+            want = _norm(_strip_woe_affix(pred))
+            hits = [
+                w
+                for w in remaining
+                if _norm(_strip_woe_affix(w)).startswith(want) or want.startswith(_norm(_strip_woe_affix(w)))
+            ]
+            if len(hits) == 1:
+                chosen = _take(hits[0])
+        if chosen is not None:
+            mapping[pred] = chosen
+    return mapping
+
 
 @dataclass(frozen=True)
 class Gates:
@@ -105,6 +219,11 @@ class Gates:
 
     # --- A1: optional XGBoost sub-model ------------------------------------
     submodel_max_depth: int = 3
+
+    # --- A1: segment vs portfolio grouping comparison ------------------------
+    grouping_woe_shift_material: float = 0.25
+    grouping_edge_shift_frac: float = 0.20
+    grouping_sign_flip_floor: float = 0.05
 
     # --- A1: predictor stability over vintages ------------------------------
     stability_psi_max: float = 0.25
