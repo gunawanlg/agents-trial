@@ -25,11 +25,13 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
+from sklearn.metrics import roc_auc_score
+
 from scorecard_segment_eval.binning import BinningModel
 from scorecard_segment_eval.characteristics import psi_from_labels
 from scorecard_segment_eval.metrics import gini
 from scorecard_segment_eval.parallel import map_jobs
-from scorecard_segment_eval.schema import Gates
+from scorecard_segment_eval.schema import Gates, looks_like_val_column, map_pred_to_val
 
 STABILITY_COLUMNS = (
     "feature",
@@ -54,19 +56,94 @@ STABILITY_COLUMNS = (
 )
 
 
+def _rank_gini(y, score):
+    # type: (np.ndarray, np.ndarray) -> float
+    """Univariate Gini from rank order, without clipping scores to ``[0, 1]``.
+
+    :func:`~scorecard_segment_eval.metrics.gini` treats the score as a PD and
+    clips it.  Logit / ``_LIN`` / ``_VAL`` values sit outside that range, so
+    the clip collapses them and ``gini_reference`` becomes NaN.  Ranking AUC
+    is the right univariate measure for those columns.
+    """
+    y_arr = np.asarray(y, dtype=float)
+    s_arr = np.asarray(score, dtype=float)
+    mask = np.isfinite(y_arr) & np.isfinite(s_arr)
+    if int(mask.sum()) < 2:
+        return float("nan")
+    y_m = y_arr[mask]
+    s_m = s_arr[mask]
+    if y_m.min() == y_m.max() or s_m.min() == s_m.max():
+        return float("nan")
+    return 2.0 * float(roc_auc_score(y_m, s_m)) - 1.0
+
+
+def _fill_nonfinite(values, impute=None):
+    # type: (np.ndarray, Optional[float]) -> np.ndarray
+    arr = np.asarray(values, dtype=float)
+    finite = np.isfinite(arr)
+    if finite.all():
+        return arr
+    fill = impute
+    if fill is None:
+        fill = float(np.nanmedian(arr)) if finite.any() else 0.0
+    return np.where(finite, arr, float(fill))
+
+
+def _strip_lin_affix(name):
+    # type: (str) -> str
+    text = str(name)
+    lowered = text.lower()
+    for suffix in ("_val", "_lin"):
+        if lowered.endswith(suffix) and len(lowered) > len(suffix):
+            return text[: len(text) - len(suffix)]
+    return text
+
+
+def _lin_alias_map(features, frame, pred_val_map=None):
+    # type: (Sequence[str], pd.DataFrame, Optional[Dict[str, str]]) -> Dict[str, str]
+    """Map raw predictors onto ``_LIN`` / ``_VAL`` columns present in ``frame``."""
+    mapping = {}  # type: Dict[str, str]
+    if pred_val_map:
+        for raw, alias in pred_val_map.items():
+            if alias is not None and str(alias) in frame.columns:
+                mapping[str(raw)] = str(alias)
+    val_cols = [c for c in frame.columns if looks_like_val_column(c)]
+    auto = map_pred_to_val(features, val_cols)
+    for raw, alias in auto.items():
+        mapping.setdefault(raw, alias)
+    return mapping
+
+
+def _grouping_spec(grouping, assessed, original):
+    # type: (Optional[BinningModel], str, str) -> Any
+    if grouping is None:
+        return None
+    specs = grouping.specs or {}
+    for key in (assessed, original, _strip_lin_affix(assessed)):
+        spec = specs.get(key)
+        if spec is not None:
+            return spec
+    return None
+
+
 def gini_standard_error(y, score):
     # type: (np.ndarray, np.ndarray) -> float
     """Hanley-McNeil standard error of the Gini for one sample.
 
     Closed form, so it costs nothing next to a bootstrap and is available even
-    for the small per-vintage slices where it matters most.
+    for the small per-vintage slices where it matters most.  Uses rank-order
+    Gini so logit / ``_LIN`` scores outside ``[0, 1]`` still have a finite SE.
     """
     y_arr = np.asarray(y, dtype=float)
+    s_arr = np.asarray(score, dtype=float)
+    mask = np.isfinite(y_arr) & np.isfinite(s_arr)
+    y_arr = y_arr[mask]
+    s_arr = s_arr[mask]
     n_pos = float((y_arr == 1).sum())
     n_neg = float((y_arr == 0).sum())
     if n_pos < 1 or n_neg < 1:
         return float("nan")
-    g = gini(y_arr, score)
+    g = _rank_gini(y_arr, s_arr)
     if not np.isfinite(g):
         return float("nan")
     a = max(0.5 * (g + 1.0), 1.0 - 0.5 * (g + 1.0))
@@ -167,74 +244,112 @@ def predictor_stability(
     min_rows_per_vintage=30,
     n_jobs=None,
     reference_frame=None,
+    pred_val_map=None,
 ):
-    # type: (pd.DataFrame, Sequence[str], str, Optional[str], Optional[Gates], Optional[BinningModel], str, int, Optional[int], Optional[pd.DataFrame]) -> pd.DataFrame
+    # type: (pd.DataFrame, Sequence[str], str, Optional[str], Optional[Gates], Optional[BinningModel], str, int, Optional[int], Optional[pd.DataFrame], Optional[Dict[str, str]]) -> pd.DataFrame
     """One stability row per predictor.  Parallel over predictors.
 
     Logit / VAL / LIN predictors are assessed on portfolio-quantile bins
     (segment vs overall when ``reference_frame`` is supplied), with
     ``__missing__`` kept as its own category.
+
+    When a predictor is used in linear / logit form, the matching ``_LIN`` /
+    ``_VAL`` column is assessed instead of the raw feature (for example
+    ``ds_v4_LIN`` instead of ``ds_v4``).  Those columns already carry the
+    production null-imputation, so ``gini_reference`` stays finite.
     """
     gates = gates or Gates()
-    features = [c for c in pred_cols if c in df.columns]
-    if not features or target_col not in df.columns:
+    requested = [c for c in pred_cols]
+    frame = df.reset_index(drop=True)
+    overall = pd.DataFrame(reference_frame).reset_index(drop=True) if reference_frame is not None else frame
+    alias_map = _lin_alias_map(requested, frame, pred_val_map)
+    features = []  # type: List[str]
+    spec_names = {}  # type: Dict[str, str]
+    seen = set()
+    for raw in requested:
+        assessed = alias_map.get(raw, raw)
+        if assessed != raw and assessed not in overall.columns:
+            assessed = raw
+        if assessed not in frame.columns:
+            continue
+        if assessed in seen:
+            continue
+        seen.add(assessed)
+        features.append(assessed)
+        spec_names[assessed] = raw
+    if not features or target_col not in frame.columns:
         return pd.DataFrame(columns=list(STABILITY_COLUMNS))
 
-    frame = df.reset_index(drop=True)
     y_all = frame[target_col].to_numpy(dtype=float)
     if date_col is None or date_col not in frame.columns:
         rows = [_empty_stability_row(f, ["no_date_column"]) for f in features]
         return pd.DataFrame(rows)[list(STABILITY_COLUMNS)]
 
-    overall = pd.DataFrame(reference_frame).reset_index(drop=True) if reference_frame is not None else frame
     periods = vintage_labels(frame[date_col], freq=freq)
     counts = periods.value_counts(dropna=True)
     kept = sorted([p for p in counts.index if counts[p] >= min_rows_per_vintage], key=str)
+    woe_fit_cols = [f for f in features if not looks_like_val_column(f)]
     if grouping is None:
-        if date_col is not None and date_col in frame.columns:
-            fit_frame = frame[list(features) + [c for c in [date_col] if c not in features]]
+        if not woe_fit_cols:
+            grouping = BinningModel(specs={})
+        elif date_col is not None and date_col in frame.columns:
+            fit_frame = frame[list(woe_fit_cols) + [c for c in [date_col] if c not in woe_fit_cols]]
             grouping = BinningModel.fit(
                 fit_frame, frame[target_col], gates=gates, n_jobs=1, date_col=date_col
             )
         else:
-            grouping = BinningModel.fit(frame[features], frame[target_col], gates=gates, n_jobs=1)
+            grouping = BinningModel.fit(frame[woe_fit_cols], frame[target_col], gates=gates, n_jobs=1)
 
     def _one(feature):
         # type: (str) -> Dict[str, Any]
         from scorecard_segment_eval.binning import MISSING_LABEL, _is_logit_spec
         from scorecard_segment_eval.characteristics import quantile_bin_labels
 
-        spec = grouping.specs.get(feature)
-        if spec is None:
+        original = spec_names.get(feature, feature)
+        spec = _grouping_spec(grouping, feature, original)
+        already_lin = looks_like_val_column(feature)
+        is_logit = already_lin or (spec is not None and _is_logit_spec(spec))
+        if spec is None and not is_logit:
             return _empty_stability_row(feature, ["no_grouping"])
-        is_logit = _is_logit_spec(spec)
         binning = "grouping"
         n_bins = int(getattr(gates, "n_woe_bins", 10) or 10)
+        source = feature if feature in frame.columns else original
+        if source in overall.columns:
+            source_overall = source
+        elif original in overall.columns:
+            source_overall = original
+        else:
+            source_overall = source
         if is_logit:
-            ref_vals = overall[feature] if feature in overall.columns else frame[feature]
-            labels_all, order = quantile_bin_labels(frame[feature], ref_vals, n_bins=n_bins)
+            ref_vals = overall[source_overall] if source_overall in overall.columns else frame[source]
+            labels_all, order = quantile_bin_labels(frame[source], ref_vals, n_bins=n_bins)
             labels_overall, _order_ref = quantile_bin_labels(ref_vals, ref_vals, n_bins=n_bins)
             if MISSING_LABEL not in order:
                 order = list(order) + [MISSING_LABEL]
             binning = "logit_quantiles"
             psi_reference = labels_overall
         else:
-            labels_all = spec.assign(frame[feature])
+            labels_all = spec.assign(frame[source])
             order = list(spec.bin_order())
             if spec.missing_label not in order:
                 order.append(spec.missing_label)
             psi_reference = labels_all
-        woe_all = spec.transform_woe(frame[feature])
-        if is_logit:
-            finite = np.isfinite(woe_all)
-            if not finite.all():
-                fill = spec.impute
-                if fill is None:
-                    fill = float(np.nanmedian(woe_all)) if finite.any() else 0.0
-                woe_all = np.where(finite, woe_all, float(fill))
+        if is_logit and already_lin:
+            # Production LIN/VAL already is logit(p) with nulls imputed.
+            woe_all = pd.to_numeric(frame[source], errors="coerce").to_numpy(dtype=float)
+            impute = spec.impute if spec is not None else None
+            woe_all = _fill_nonfinite(woe_all, impute)
+        elif spec is not None:
+            woe_all = spec.transform_woe(frame[source] if source in frame.columns else frame[original])
+            if is_logit:
+                woe_all = _fill_nonfinite(woe_all, spec.impute)
+        else:
+            woe_all = _fill_nonfinite(
+                pd.to_numeric(frame[source], errors="coerce").to_numpy(dtype=float)
+            )
         score_all = woe_all if is_logit else -woe_all
-        ref_gini = gini(y_all, score_all)
-        ref_iv = float(spec.iv)
+        ref_gini = _rank_gini(y_all, score_all) if is_logit else gini(y_all, score_all)
+        ref_iv = float(spec.iv) if spec is not None else float("nan")
         ref_sign = _slope_sign(woe_all, y_all)
         if len(kept) < max(int(gates.stability_min_vintages), 2):
             row = _empty_stability_row(feature, ["insufficient_vintages"])
@@ -269,7 +384,7 @@ def predictor_stability(
             woe_v = woe_all[mask]
             score_v = woe_v if is_logit else -woe_v
             psis.append(psi_from_labels(labels_v, psi_reference, order=order)["psi"])
-            g_v = gini(y_v, score_v)
+            g_v = _rank_gini(y_v, score_v) if is_logit else gini(y_v, score_v)
             ginis.append(g_v)
             ivs.append(_iv_from_labels(labels_v, y_v, order))
             signs.append(_slope_sign(woe_v, y_v))
@@ -320,15 +435,18 @@ def predictor_stability(
             flags.append("sign_flip")
         if np.isfinite(score) and score < gates.stability_score_min:
             flags.append("low_stability_score")
-        overlap_pairs = grouping.overlapping_event_rate_pairs(
-            frame,
-            y_all,
-            date_col,
-            feature,
-            freq=freq,
-            min_rows=min_rows_per_vintage,
-            z=float(getattr(gates, "delta_gini_z", 1.64) or 1.64),
-        )
+        overlap_pairs = []
+        if not is_logit and spec is not None:
+            overlap_key = original if original in grouping.specs else feature
+            overlap_pairs = grouping.overlapping_event_rate_pairs(
+                frame,
+                y_all,
+                date_col,
+                overlap_key,
+                freq=freq,
+                min_rows=min_rows_per_vintage,
+                z=float(getattr(gates, "delta_gini_z", 1.64) or 1.64),
+            )
         if overlap_pairs:
             flags.append("overlapping_event_rate_bounds")
         return {

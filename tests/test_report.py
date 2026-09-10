@@ -1,5 +1,6 @@
 import os
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -233,10 +234,16 @@ def test_condensed_html_report_has_toc_frozen_tables_and_filters(result, tmp_pat
     vintage_part = html.split('id="sec-vintage"', 1)[1]
     gates_split = vintage_part.split('id="sec-gates"', 1)[0]
     assert "<table" not in gates_split
-    assert "portfolio event rate" in gates_split
-    assert "event rate" in gates_split
-    assert "Gini" in gates_split
-    assert "O/E" not in gates_split
+    note = gates_split.split("<h3>", 1)[0]
+    assert "portfolio event rate" in note
+    assert "portfolio Gini" in note
+    assert "outside" in note
+    assert "O/E" not in note
+    from scorecard_segment_eval.condensed_report import _portfolio_gini_lookup
+
+    gini_lookup = _portfolio_gini_lookup(res.vintage)
+    assert gini_lookup
+    assert any(np.isfinite(v) for v in gini_lookup.values())
     path = save_report(
         res, str(tmp_path / "segment_evaluation_report_condensed.html"), gates=gates
     )

@@ -186,8 +186,61 @@ def test_logit_stability_uses_overall_quantiles_including_missing():
     )
     row = table.set_index("feature").loc["x"]
     assert row["stability_binning"] == "logit_quantiles"
+    assert np.isfinite(row["gini_reference"])
     from scorecard_segment_eval.characteristics import quantile_bin_labels
 
     labels, order = quantile_bin_labels(book["x"], overall["x"])
     assert MISSING_LABEL in order
     assert MISSING_LABEL in set(str(v) for v in labels)
+
+
+def test_linear_form_stability_uses_lin_column_and_fills_missing():
+    """Raw PD with missings is assessed on the imputed ``_LIN`` column."""
+    book = _monthly_book(n_months=18, n_per=200, seed=13)
+    book = book.copy()
+    pd_raw = 1.0 / (1.0 + np.exp(-book["x"].to_numpy()))
+    book["ds_v4"] = pd_raw
+    book.loc[book.index[:90], "ds_v4"] = np.nan
+    clipped = np.clip(pd_raw, 1e-6, 1.0 - 1e-6)
+    logit = np.log(clipped / (1.0 - clipped))
+    book["ds_v4_LIN"] = np.where(np.isfinite(pd_raw), logit, -2.5)
+    grouping = BinningModel(
+        specs={
+            "ds_v4": BinSpec(
+                feature="ds_v4",
+                kind="logit",
+                method="sql_logit",
+                transform="logit",
+                labels=["logit"],
+                impute=-2.5,
+                output_name="ds_v4_LIN",
+            )
+        }
+    )
+    table = predictor_stability(
+        book,
+        ["ds_v4"],
+        "y",
+        "date",
+        Gates(stability_min_reference_gini=0.0),
+        grouping=grouping,
+        reference_frame=book,
+    )
+    assert list(table["feature"]) == ["ds_v4_LIN"]
+    row = table.set_index("feature").loc["ds_v4_LIN"]
+    assert row["stability_binning"] == "logit_quantiles"
+    assert np.isfinite(row["gini_reference"])
+    assert abs(float(row["gini_reference"])) > 0.05
+
+
+def test_rank_gini_on_logit_scores_is_finite():
+    from scorecard_segment_eval.stability import _rank_gini, gini_standard_error
+
+    rng = np.random.default_rng(14)
+    logit = rng.normal(loc=-2.4, scale=0.6, size=800)
+    y = rng.binomial(1, 1.0 / (1.0 + np.exp(-logit)))
+    g = _rank_gini(y, logit)
+    se = gini_standard_error(y, logit)
+    assert np.isfinite(g)
+    assert abs(g) > 0.2
+    assert np.isfinite(se)

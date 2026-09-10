@@ -304,8 +304,11 @@ whose name contains `condensed.html`) writes a shorter analyst view: a table of
 contents with back-to-top links, frozen `segment_col` / `segment_value` columns,
 RECALIBRATE actions grouped by segment, 10% matched-AR gaps only, PSI / rank
 reversal and grouping-comparison exceptions with inline plots, and vintage
-charts instead of the vintage table. Logit / VAL / LIN predictors are assessed on
-portfolio-quantile bins (including `__missing__`) rather than a dummy single bin.
+charts instead of the vintage table. Predictors used in linear / logit form are
+assessed on the matching `_LIN` / `_VAL` column (nulls already imputed) rather than
+the raw feature, using portfolio-quantile bins (including `__missing__` when any
+nulls remain). Vintage charts put a colour-only legend outside the plot and overlay
+the portfolio event rate and portfolio Gini as black dashed lines.
 
 ## Tests
 

@@ -222,6 +222,7 @@ def _run_holdout_models(
                 segment_col=segment_col,
                 segment_value=segment_value,
                 logit_cols=cols.logit_pred_cols(grouping=grouping),
+                pred_val_map=cols.pred_val_map(),
             )
             delta = bootstrap_delta_gini(
                 y,
@@ -618,6 +619,7 @@ def _overall_stability(df, obs_all, cols, gates, grouping, n_jobs):
         grouping=grouping,
         n_jobs=n_jobs,
         reference_frame=obs_all,
+        pred_val_map=cols.pred_val_map(),
     )
     if table.empty:
         return table
