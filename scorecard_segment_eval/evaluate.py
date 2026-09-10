@@ -412,14 +412,19 @@ def _evaluate_one_segment(task):
         "gini": m_obs.get("gini"),
         "gini_ratio": (m_obs.get("gini") / overall_gini) if overall_gini else float("nan"),
         "oe": m_obs.get("oe"),
+        "obs_rate": m_obs.get("obs_rate"),
+        "mean_pd": m_obs.get("mean_pd"),
         "ece": m_obs.get("ece"),
         "vintage_gini_ratio": ratio,
         "ar_segment": matched.get("ar_segment"),
         "ar_reference": matched.get("ar_reference"),
+        "ar_reference_cutoff": matched.get("ar_reference_cutoff"),
         "ar_gap": matched.get("ar_gap"),
         "ar_gap_triggered": matched.get("ar_gap_triggered"),
         "matched_ar": matched.get("matched_ar"),
         "matched_ar_anchor": matched.get("matched_ar_anchor"),
+        "matched_ar_threshold_segment": matched.get("matched_ar_threshold_segment"),
+        "matched_ar_threshold_reference": matched.get("matched_ar_threshold_reference"),
         "gini_at_matched_ar": matched.get("gini_at_matched_ar"),
         "gini_reference_at_matched_ar": matched.get("gini_reference_at_matched_ar"),
         "gini_at_matched_ar_gap": matched.get("gini_at_matched_ar_gap"),
@@ -566,6 +571,11 @@ def evaluate_segments(
     if not overall_stability.empty:
         stability_frames.insert(0, overall_stability)
 
+    _ratio_all, overall_vint = _vintage_ratio(obs_all, cols)
+    if not overall_vint.empty:
+        overall_vint = overall_vint.assign(segment_col="__overall__", segment_value="ALL")
+        vintage_frames.insert(0, overall_vint)
+
     meta = {
         "n_rows": int(len(df)),
         "n_observable": int(len(obs_all)),
@@ -607,6 +617,7 @@ def _overall_stability(df, obs_all, cols, gates, grouping, n_jobs):
         gates=gates,
         grouping=grouping,
         n_jobs=n_jobs,
+        reference_frame=obs_all,
     )
     if table.empty:
         return table

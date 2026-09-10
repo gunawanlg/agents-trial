@@ -54,6 +54,7 @@ from scorecard_segment_eval.report import (
     render_markdown_report,
     save_report,
 )
+from scorecard_segment_eval.condensed_report import render_condensed_html_report
 from scorecard_segment_eval.schema import Gates, ScorecardColumns, map_pred_to_val, map_pred_to_woe
 from scorecard_segment_eval.sql_model import (
     ScorecardSQLModel,
@@ -147,6 +148,7 @@ __all__ = [
     "decision_table",
     "recommendations",
     "render_html_report",
+    "render_condensed_html_report",
     "render_markdown_report",
     "save_report",
     # parallelism

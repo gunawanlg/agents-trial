@@ -16,7 +16,7 @@ Both paths return the same set of keys and record which method was used, plus
 explicit accounting for missing values and out-of-reference-range values.
 """
 
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -27,6 +27,7 @@ from scorecard_segment_eval.binning import (
     OTHER_LABEL,
     BinningModel,
     BinSpec,
+    _is_logit_spec,
     assign_numeric_bins,
     edge_labels,
     information_value,
@@ -41,6 +42,7 @@ PSI_EPSILON = 1e-6
 METHOD_GROUPING = "grouping_bins"
 METHOD_CATEGORICAL = "categorical_levels"
 METHOD_NUMERIC_DECILES = "numeric_portfolio_deciles"
+METHOD_LOGIT_QUANTILES = "logit_quantile_bins"
 METHOD_UNAVAILABLE = "unavailable"
 
 #: Keys every PSI computation returns, so the shape is stable across branches.
@@ -69,6 +71,7 @@ def _empty_psi(method=METHOD_UNAVAILABLE):
         "psi_missing_share_reference": float("nan"),
         "psi_out_of_range_share_segment": float("nan"),
         "psi_empty_bins": 0,
+        "psi_bin_table": [],
     }
 
 
@@ -121,6 +124,10 @@ def psi_from_labels(labels_segment, labels_reference, order=None, epsilon=PSI_EP
     ref_share = np.clip(ref_share / max(ref_share.sum(), 1.0), epsilon, None)
     contrib = (seg_share - ref_share) * np.log(seg_share / ref_share)
     worst = int(np.argmax(contrib)) if len(contrib) else -1
+    raw_seg = np.asarray([float(seg_counts.get(b, 0.0)) for b in bins], dtype=float)
+    raw_ref = np.asarray([float(ref_counts.get(b, 0.0)) for b in bins], dtype=float)
+    n_seg = max(float(raw_seg.sum()), 1.0)
+    n_ref = max(float(raw_ref.sum()), 1.0)
     out = _empty_psi()
     out.update(
         {
@@ -131,9 +138,40 @@ def psi_from_labels(labels_segment, labels_reference, order=None, epsilon=PSI_EP
             "psi_missing_share_segment": float((seg == MISSING_LABEL).mean()),
             "psi_missing_share_reference": float((ref == MISSING_LABEL).mean()),
             "psi_empty_bins": empty_bins,
+            "psi_bin_table": [
+                {
+                    "bin": str(bins[i]),
+                    "share_segment": float(raw_seg[i] / n_seg),
+                    "share_reference": float(raw_ref[i] / n_ref),
+                    "contrib": float(contrib[i]),
+                }
+                for i in range(len(bins))
+            ],
         }
     )
     return out
+
+
+def quantile_bin_labels(values, reference_values, n_bins=10, missing_label=MISSING_LABEL):
+    # type: (Any, Any, int, str) -> Tuple[np.ndarray, List[str]]
+    """Assign portfolio-quantile bins, always keeping ``__missing__`` in the order."""
+    edges = portfolio_decile_edges(reference_values, n_bins=n_bins)
+    if edges is None:
+        labels = _levels(values)
+        order = []  # type: List[str]
+        for label in labels:
+            text = str(label)
+            if text not in order:
+                order.append(text)
+        if missing_label not in order:
+            order.append(missing_label)
+        return labels, order
+    names = edge_labels(edges)
+    assigned = assign_numeric_bins(values, edges, names, missing_label=missing_label)
+    order = list(names)
+    if missing_label not in order:
+        order.append(missing_label)
+    return assigned, order
 
 
 def psi_for_feature(
@@ -149,12 +187,22 @@ def psi_for_feature(
 
     ``spec`` is a grouping definition for the feature; when present the
     existing bins are reused.  ``treat_as`` (``"categorical"`` / ``"numeric"``)
-    forces a branch, otherwise the dtype decides.
+    forces a branch, otherwise the dtype decides.  Logit / VAL / LIN specs
+    use portfolio quantile bins (plus ``__missing__``) rather than the dummy
+    single ``logit`` label.
     """
     seg = pd.Series(segment_values).reset_index(drop=True)
     ref = pd.Series(reference_values).reset_index(drop=True)
     if len(seg) == 0 or len(ref) == 0:
         return _empty_psi()
+
+    if spec is not None and _is_logit_spec(spec):
+        labels_seg, order = quantile_bin_labels(seg, ref, n_bins=n_bins)
+        labels_ref, _order_ref = quantile_bin_labels(ref, ref, n_bins=n_bins)
+        out = psi_from_labels(labels_seg, labels_ref, order=order, epsilon=epsilon)
+        out["psi_method"] = METHOD_LOGIT_QUANTILES
+        out["psi_out_of_range_share_segment"] = _out_of_range_share(seg, ref, None)
+        return out
 
     if spec is not None:
         labels_seg = spec.assign(seg)
@@ -265,6 +313,10 @@ def psi_table(
 def _bin_labels_for_diagnostics(series_ref, series_seg, spec, n_bins):
     # type: (Any, Any, Optional[BinSpec], int) -> Any
     """Return ``(labels_ref, labels_seg, method, numeric)`` on one fixed ruler."""
+    if spec is not None and _is_logit_spec(spec):
+        labels_ref, _order = quantile_bin_labels(series_ref, series_ref, n_bins=n_bins)
+        labels_seg, _unused = quantile_bin_labels(series_seg, series_ref, n_bins=n_bins)
+        return labels_ref, labels_seg, METHOD_LOGIT_QUANTILES, True
     if spec is not None:
         return spec.assign(series_ref), spec.assign(series_seg), METHOD_GROUPING, spec.kind == "numeric"
     numeric_like = pd.api.types.is_numeric_dtype(series_ref) and pd.Series(series_ref).nunique(dropna=True) > 2

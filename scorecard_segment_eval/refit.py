@@ -717,6 +717,7 @@ def refit_with_diagnostics(
         gates=gates,
         grouping=grouping,
         n_jobs=n_jobs,
+        reference_frame=reference,
     )
     summary = stability_summary(stability, gates=gates)
     result = RefitResult(

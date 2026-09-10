@@ -15,6 +15,7 @@ from scorecard_segment_eval.report import (
     render_markdown_report,
     save_report,
 )
+from scorecard_segment_eval.condensed_report import render_condensed_html_report
 
 
 @pytest.fixture(scope="module")
@@ -201,3 +202,110 @@ def test_html_table_handles_missing_and_boolean_values():
     assert "<td class=\"num\">-</td>" in out
     assert ">yes<" in out and ">no<" in out
     assert html_table(pd.DataFrame(), empty_message="nothing").endswith("nothing</p>")
+
+
+def test_condensed_html_report_has_toc_frozen_tables_and_filters(result, tmp_path):
+    res, gates = result
+    html = render_condensed_html_report(res, gates=gates)
+    assert html.startswith("<!DOCTYPE html>")
+    assert 'id="top"' in html
+    assert 'href="#top"' in html
+    assert 'class="frozen"' in html
+    assert 'id="sec-next"' in html
+    assert "Recalibrate the PD level for" in html
+    assert "channel" in html
+    assert "observed" in html
+    assert "expected" in html
+    assert "How the matched-AR cutoff is simulated" in html
+    assert "ar_reference_cutoff" in html
+    assert "data-cutoff" in html
+    assert "id=\"ar-table\"" in html
+    assert "gini_refit" in html
+    assert "stability_reason" in html
+    assert "scorecard.sql" in html
+    assert "portfolio_bin" in html
+    assert "flag_meaning" in html or "flag-viz" in html
+    assert "id=\"sec-gates\"" in html
+    assert "min_n" in html
+    assert "class=\"idx\"" in html
+    assert "class=\"idx2\"" in html
+    assert "class=\"frozen\"" in html
+    vintage_part = html.split('id="sec-vintage"', 1)[1]
+    gates_split = vintage_part.split('id="sec-gates"', 1)[0]
+    assert "<table" not in gates_split
+    assert "portfolio event rate" in gates_split
+    assert "event rate" in gates_split
+    assert "Gini" in gates_split
+    assert "O/E" not in gates_split
+    path = save_report(
+        res, str(tmp_path / "segment_evaluation_report_condensed.html"), gates=gates
+    )
+    with open(path) as handle:
+        saved = handle.read()
+    assert saved.startswith("<!DOCTYPE html>")
+    assert "back to top" in saved
+    fmt_path = save_report(res, str(tmp_path / "r.html"), fmt="condensed", gates=gates)
+    with open(fmt_path) as handle:
+        assert "back to top" in handle.read()
+
+
+def test_condensed_html_escapes_values():
+    res = SegmentEvalResult(
+        segment_summary=pd.DataFrame(),
+        decisions=pd.DataFrame(
+            [
+                {
+                    "segment_col": "channel",
+                    "segment_value": "<script>alert(1)</script>",
+                    "q1_verdict": "WEAK",
+                    "failed_pillars": "rank_order",
+                    "important": True,
+                    "q2_action": "KEEP_POOLED",
+                    "q2_reason": "need_new_information_not_new_coefficients",
+                    "volume_share": 0.4,
+                    "default_share": 0.4,
+                    "gini": 0.1,
+                    "stability_reason": "stable",
+                }
+            ]
+        ),
+        refit_comparison=pd.DataFrame(),
+        characteristics=pd.DataFrame(),
+        vintage=pd.DataFrame(),
+    )
+    html = render_condensed_html_report(res)
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;" in html
+
+
+def test_condensed_recalibrate_groups_values_under_segment_col():
+    from scorecard_segment_eval.condensed_report import _grouped_next_actions
+
+    recs = pd.DataFrame(
+        [
+            {
+                "rank": 1,
+                "priority": 1,
+                "action": "RECALIBRATE",
+                "segment_col": "channel",
+                "segment_value": "miscal",
+                "recommendation": "Recalibrate the PD level of channel = miscal.",
+                "why": "why-a",
+                "evidence": "e1",
+            },
+            {
+                "rank": 2,
+                "priority": 1,
+                "action": "RECALIBRATE",
+                "segment_col": "channel",
+                "segment_value": "shift",
+                "recommendation": "Recalibrate the PD level of channel = shift.",
+                "why": "why-b",
+                "evidence": "e2",
+            },
+        ]
+    )
+    html = _grouped_next_actions(recs)
+    assert html.count("Recalibrate the PD level for") == 1
+    assert "miscal, shift" in html
+    assert html.count("RECALIBRATE") == 1

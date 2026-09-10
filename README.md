@@ -299,6 +299,14 @@ segment-vs-portfolio grouping comparison, refit performance and stability
 findings, and a prioritised recommendation list from `recommendations`.
 `save_report` picks the format from the file extension.
 
+`render_condensed_html_report` (or `save_report(..., fmt="condensed")`, or a path
+whose name contains `condensed.html`) writes a shorter analyst view: a table of
+contents with back-to-top links, frozen `segment_col` / `segment_value` columns,
+RECALIBRATE actions grouped by segment, 10% matched-AR gaps only, PSI / rank
+reversal and grouping-comparison exceptions with inline plots, and vintage
+charts instead of the vintage table. Logit / VAL / LIN predictors are assessed on
+portfolio-quantile bins (including `__missing__`) rather than a dummy single bin.
+
 ## Tests
 
 ```bash
