@@ -966,10 +966,12 @@ def _stability_section(result, gates=None):
     gates = gates or _gates_from_result(result)
     stability = result.stability if result.stability is not None else pd.DataFrame()
     intro = (
-        '<p class="note">Logit / VAL / LIN predictors are assessed on portfolio-quantile bins '
-        "(segment vs overall), with <code>__missing__</code> kept as its own category. Ordinary "
-        "WoE predictors still use the grouping bins. The flag column draws each metric against "
-        "its gate (black tick); a red bar is a fired flag.</p>"
+        '<p class="note">When a predictor is used in linear / logit form, stability is assessed '
+        "on the matching <code>_LIN</code> / <code>_VAL</code> column (already null-imputed) "
+        "rather than the raw feature. Those columns are binned on portfolio quantiles "
+        "(segment vs overall), with <code>__missing__</code> kept as its own category if any "
+        "nulls remain. Ordinary WoE predictors still use the grouping bins. The flag column "
+        "draws each metric against its gate (black tick); a red bar is a fired flag.</p>"
     )
     if stability is None or stability.empty:
         return intro + '<p class="note">No stability diagnostics available.</p>'
@@ -1027,6 +1029,16 @@ def _stability_section(result, gates=None):
 
 def _portfolio_rate_lookup(vintage):
     # type: (pd.DataFrame) -> Dict[str, float]
+    return _portfolio_vintage_lookup(vintage, "event_rate")
+
+
+def _portfolio_gini_lookup(vintage):
+    # type: (pd.DataFrame) -> Dict[str, float]
+    return _portfolio_vintage_lookup(vintage, "gini")
+
+
+def _portfolio_vintage_lookup(vintage, kind):
+    # type: (pd.DataFrame, str) -> Dict[str, float]
     if vintage is None or vintage.empty:
         return {}
     overall = vintage.loc[vintage["segment_col"].astype(str).eq("__overall__")]
@@ -1034,17 +1046,25 @@ def _portfolio_rate_lookup(vintage):
         return {}
     out = {}
     for _idx, row in overall.iterrows():
+        key = str(row.get("vintage"))
+        if kind == "gini":
+            try:
+                out[key] = float(row.get("gini"))
+            except (TypeError, ValueError):
+                out[key] = float("nan")
+            continue
         n = float(row.get("n") or 0.0)
         defaults = float(row.get("defaults") or 0.0)
-        out[str(row.get("vintage"))] = defaults / n if n else float("nan")
+        out[key] = defaults / n if n else float("nan")
     return out
 
 
-def _plot_vintage_col(part, segment_col, portfolio_rates):
-    # type: (pd.DataFrame, str, Dict[str, float]) -> str
+def _plot_vintage_col(part, segment_col, portfolio_rates, portfolio_ginis=None):
+    # type: (pd.DataFrame, str, Dict[str, float], Optional[Dict[str, float]]) -> str
     plt = _matplotlib()
     if plt is None:
         return '<p class="note">Vintage plot requires matplotlib (install the plot extra).</p>'
+    portfolio_ginis = portfolio_ginis or {}
     vintages = []
     for value in part["vintage"].tolist():
         text = str(value)
@@ -1062,6 +1082,9 @@ def _plot_vintage_col(part, segment_col, portfolio_rates):
     ax_rate_r = ax_rate.twinx()
     ax_gini_r = ax_gini.twinx()
     cmap = plt.get_cmap("tab10")
+    Patch = plt.matplotlib.patches.Patch
+    Line2D = plt.matplotlib.lines.Line2D
+    handles = []
     for i, sval in enumerate(hues):
         sub = part.loc[part["segment_value"].astype(str).eq(sval)]
         by_v = dict((str(r["vintage"]), r) for _, r in sub.iterrows())
@@ -1075,20 +1098,20 @@ def _plot_vintage_col(part, segment_col, portfolio_rates):
             ginis.append(float(row["gini"]) if row is not None else float("nan"))
         color = cmap(i % 10)
         offset = (i - (len(hues) - 1) / 2.0) * width
-        ax_rate.bar(x + offset, ns, width=width * 0.9, color=color, alpha=0.28, label="%s n" % sval)
-        ax_gini.bar(x + offset, ns, width=width * 0.9, color=color, alpha=0.28, label="%s n" % sval)
-        ax_rate_r.plot(x, rates, marker="o", color=color, label="%s event rate" % sval)
-        ax_gini_r.plot(x, ginis, marker="s", linestyle="--", color=color, label="%s gini" % sval)
+        ax_rate.bar(x + offset, ns, width=width * 0.9, color=color, alpha=0.28)
+        ax_gini.bar(x + offset, ns, width=width * 0.9, color=color, alpha=0.28)
+        ax_rate_r.plot(x, rates, marker="o", color=color)
+        ax_gini_r.plot(x, ginis, marker="s", color=color)
+        handles.append(Patch(facecolor=color, edgecolor=color, alpha=0.85, label=str(sval)))
+    portfolio_style = {"color": "black", "linewidth": 2.4, "linestyle": "--"}
     if portfolio_rates:
         pr = [portfolio_rates.get(v, float("nan")) for v in vintages]
-        ax_rate_r.plot(
-            x,
-            pr,
-            color="black",
-            linewidth=2.4,
-            linestyle=(0, (5, 2, 1, 2)),
-            label="portfolio event rate",
-        )
+        ax_rate_r.plot(x, pr, **portfolio_style)
+        handles.append(Line2D([0], [0], color="black", linestyle="--", linewidth=2.4, label="portfolio event rate"))
+    if portfolio_ginis:
+        pg = [portfolio_ginis.get(v, float("nan")) for v in vintages]
+        ax_gini_r.plot(x, pg, **portfolio_style)
+        handles.append(Line2D([0], [0], color="black", linestyle="--", linewidth=2.4, label="portfolio Gini"))
     ax_rate.set_ylabel("n")
     ax_rate_r.set_ylabel("event rate")
     ax_gini.set_ylabel("n")
@@ -1097,11 +1120,15 @@ def _plot_vintage_col(part, segment_col, portfolio_rates):
     ax_gini.set_title("%s — volume and Gini" % segment_col)
     ax_gini.set_xticks(x)
     ax_gini.set_xticklabels(vintages, rotation=45, ha="right")
-    for ax, ax_r in ((ax_rate, ax_rate_r), (ax_gini, ax_gini_r)):
-        handles, labels = ax.get_legend_handles_labels()
-        h2, lab2 = ax_r.get_legend_handles_labels()
-        ax.legend(handles + h2, labels + lab2, fontsize="small", ncol=2, loc="upper left")
     fig.tight_layout()
+    fig.legend(
+        handles=handles,
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        fontsize="small",
+        frameon=False,
+        borderaxespad=0.0,
+    )
     return _fig_img(fig, "vintage %s" % segment_col)
 
 
@@ -1110,12 +1137,13 @@ def _vintage_section(result):
     vintage = result.vintage if result.vintage is not None else pd.DataFrame()
     intro = (
         '<p class="note">One chart per <code>segment_col</code>, hue = <code>segment_value</code>. '
-        "Each panel keeps the volume bars. The top panel is event rate (the black striped "
-        "line is the portfolio event rate); the bottom panel is Gini.</p>"
+        "Bars (volume) and lines share a colour; the legend sits outside the plot. "
+        "The black dashed line is the portfolio event rate (top) and the portfolio Gini (bottom).</p>"
     )
     if vintage.empty:
         return intro + '<p class="note">No vintage table available.</p>'
     portfolio_rates = _portfolio_rate_lookup(vintage)
+    portfolio_ginis = _portfolio_gini_lookup(vintage)
     parts = []
     cols = [c for c in vintage["segment_col"].astype(str).unique() if c != "__overall__"]
     if not cols:
@@ -1125,7 +1153,7 @@ def _vintage_section(result):
         if part.empty:
             continue
         parts.append("<h3>%s</h3>" % html_safe(col))
-        parts.append(_plot_vintage_col(part, col, portfolio_rates))
+        parts.append(_plot_vintage_col(part, col, portfolio_rates, portfolio_ginis))
     return intro + "".join(parts)
 
 
