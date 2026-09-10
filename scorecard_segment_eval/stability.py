@@ -225,6 +225,13 @@ def predictor_stability(
                 order.append(spec.missing_label)
             psi_reference = labels_all
         woe_all = spec.transform_woe(frame[feature])
+        if is_logit:
+            finite = np.isfinite(woe_all)
+            if not finite.all():
+                fill = spec.impute
+                if fill is None:
+                    fill = float(np.nanmedian(woe_all)) if finite.any() else 0.0
+                woe_all = np.where(finite, woe_all, float(fill))
         score_all = woe_all if is_logit else -woe_all
         ref_gini = gini(y_all, score_all)
         ref_iv = float(spec.iv)
