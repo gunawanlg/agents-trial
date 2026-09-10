@@ -497,6 +497,7 @@ def _matched_ar_illustration():
   <text x="500" y="106" font-size="11">3. Re-derive a threshold inside</text>
   <text x="500" y="122" font-size="11">each group that hits that AR.</text>
   <text id="ar-label-matched" x="500" y="148" font-size="11" fill="#1a7f37">matched cutoffs appear as dashed lines</text>
+  <text id="ar-label-matched2" x="500" y="164" font-size="11" fill="#1a7f37"></text>
   <text id="ar-label-row" x="12" y="198" font-size="11" fill="#57606a">No row selected yet. Click a 10% gap row below.</text>
   <text x="12" y="230" font-size="10" fill="#57606a">Solid red = portfolio cutoff applied to both sides. Dashed green = matched-AR cutoffs (one per group).</text>
 </svg>
@@ -547,12 +548,8 @@ def _matched_ar_illustration():
     setText("ar-label-seg-same", "same cutoff = " + fmt(cut, 4));
     setText("ar-label-ar-ref", "AR_ref = " + fmt(arRef, "%"));
     setText("ar-label-ar-seg", "AR_seg at that cutoff = " + fmt(arSeg, "%"));
-    setText(
-      "ar-label-matched",
-      "matched AR " + fmt(matched, "%") +
-      "  |  cutoff_seg " + fmt(cutSeg, 4) +
-      "  |  cutoff_ref " + fmt(cutRef, 4)
-    );
+    setText("ar-label-matched", "matched AR " + fmt(matched, "%"));
+    setText("ar-label-matched2", "cutoff_seg " + fmt(cutSeg, 4) + "   cutoff_ref " + fmt(cutRef, 4));
     setText("ar-label-row", "Showing cutoffs for " + label);
   }
   function bind() {
@@ -982,16 +979,16 @@ def _stability_section(result, gates=None):
         "segment_col",
         "segment_value",
         "feature",
+        "stable",
+        "stability_flags",
+        "flag_meaning",
         "n_vintages",
         "assessed",
         "psi_max",
         "gini_reference",
         "sign_consistency",
         "stability_score",
-        "stable",
-        "stability_flags",
         "stability_binning",
-        "flag_meaning",
     ]
     freeze = [c for c in _INDEX_COLS if c in display.columns]
     show = [c for c in cols if c in display.columns]
