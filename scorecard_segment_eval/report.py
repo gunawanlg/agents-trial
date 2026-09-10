@@ -378,6 +378,7 @@ def _decisions_with_refit(result):
             "segment_value",
             "delta_gini",
             "delta_gini_ci_low",
+            "gini_pooled",
             "gini_refit",
             "gini_recal",
             "brier_refit",
@@ -910,10 +911,24 @@ def _markdown_table(frame, columns=None):
 
 def save_report(result, path, fmt=None, title="Segment scorecard evaluation", gates=None):
     # type: (SegmentEvalResult, str, Optional[str], str, Optional[Gates]) -> str
-    """Write the report to ``path``.  Format follows the extension by default."""
+    """Write the report to ``path``.  Format follows the extension by default.
+
+    ``fmt="condensed"`` (or a path whose name contains ``condensed.html``) writes
+    the shorter analyst view from :func:`render_condensed_html_report`.
+    """
+    from scorecard_segment_eval.condensed_report import render_condensed_html_report
+
+    lowered = str(path).lower()
     if fmt is None:
-        fmt = "md" if str(path).lower().endswith((".md", ".markdown", ".txt")) else "html"
-    if fmt in ("md", "markdown", "text", "txt"):
+        if "condensed" in os.path.basename(lowered) and lowered.endswith(".html"):
+            fmt = "condensed"
+        elif lowered.endswith((".md", ".markdown", ".txt")):
+            fmt = "md"
+        else:
+            fmt = "html"
+    if fmt in ("condensed", "condensed-html", "condensed_html"):
+        content = render_condensed_html_report(result, title=title, gates=gates)
+    elif fmt in ("md", "markdown", "text", "txt"):
         content = render_markdown_report(result, title=title, gates=gates)
     else:
         content = render_html_report(result, title=title, gates=gates)
