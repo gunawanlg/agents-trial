@@ -2,10 +2,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from scorecard_segment_eval.binning import MISSING_LABEL, BinningModel, fit_bin_spec
+from scorecard_segment_eval.binning import MISSING_LABEL, BinSpec, BinningModel, fit_bin_spec
 from scorecard_segment_eval.characteristics import (
     METHOD_CATEGORICAL,
     METHOD_GROUPING,
+    METHOD_LOGIT_QUANTILES,
     METHOD_NUMERIC_DECILES,
     PSI_KEYS,
     feature_diagnostics,
@@ -163,3 +164,23 @@ def test_missing_label_is_part_of_the_bin_order():
     ref = _reference()
     spec = fit_bin_spec(ref["x"], ref["y"], Gates(), feature="x")
     assert MISSING_LABEL in spec.bin_order()
+
+
+def test_logit_psi_uses_portfolio_quantiles_and_keeps_missing():
+    ref = _reference()
+    spec = BinSpec(
+        feature="x",
+        kind="logit",
+        method="sql_logit",
+        transform="logit",
+        labels=["logit"],
+    )
+    local = ref["x"].copy()
+    local.iloc[:120] = np.nan
+    out = psi_for_feature(local, ref["x"], spec=spec)
+    assert out["psi_method"] == METHOD_LOGIT_QUANTILES
+    bins = [row["bin"] for row in out["psi_bin_table"]]
+    assert MISSING_LABEL in bins
+    assert out["psi_missing_share_segment"] == pytest.approx(120.0 / len(local), abs=1e-9)
+    assert out["psi_n_bins"] >= 2
+    assert set(PSI_KEYS).issubset(set(out))

@@ -566,6 +566,11 @@ def evaluate_segments(
     if not overall_stability.empty:
         stability_frames.insert(0, overall_stability)
 
+    _ratio_all, overall_vint = _vintage_ratio(obs_all, cols)
+    if not overall_vint.empty:
+        overall_vint = overall_vint.assign(segment_col="__overall__", segment_value="ALL")
+        vintage_frames.insert(0, overall_vint)
+
     meta = {
         "n_rows": int(len(df)),
         "n_observable": int(len(obs_all)),
@@ -607,6 +612,7 @@ def _overall_stability(df, obs_all, cols, gates, grouping, n_jobs):
         gates=gates,
         grouping=grouping,
         n_jobs=n_jobs,
+        reference_frame=obs_all,
     )
     if table.empty:
         return table

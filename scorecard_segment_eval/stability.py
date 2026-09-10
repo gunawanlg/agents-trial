@@ -50,6 +50,7 @@ STABILITY_COLUMNS = (
     "stability_score",
     "stable",
     "stability_flags",
+    "stability_binning",
 )
 
 
@@ -130,6 +131,7 @@ def _empty_stability_row(feature, flags):
         "stability_score": float("nan"),
         "stable": True,
         "stability_flags": ",".join(flags),
+        "stability_binning": "",
     }
 
 
@@ -164,9 +166,15 @@ def predictor_stability(
     freq="M",
     min_rows_per_vintage=30,
     n_jobs=None,
+    reference_frame=None,
 ):
-    # type: (pd.DataFrame, Sequence[str], str, Optional[str], Optional[Gates], Optional[BinningModel], str, int, Optional[int]) -> pd.DataFrame
-    """One stability row per predictor.  Parallel over predictors."""
+    # type: (pd.DataFrame, Sequence[str], str, Optional[str], Optional[Gates], Optional[BinningModel], str, int, Optional[int], Optional[pd.DataFrame]) -> pd.DataFrame
+    """One stability row per predictor.  Parallel over predictors.
+
+    Logit / VAL / LIN predictors are assessed on portfolio-quantile bins
+    (segment vs overall when ``reference_frame`` is supplied), with
+    ``__missing__`` kept as its own category.
+    """
     gates = gates or Gates()
     features = [c for c in pred_cols if c in df.columns]
     if not features or target_col not in df.columns:
@@ -178,6 +186,7 @@ def predictor_stability(
         rows = [_empty_stability_row(f, ["no_date_column"]) for f in features]
         return pd.DataFrame(rows)[list(STABILITY_COLUMNS)]
 
+    overall = pd.DataFrame(reference_frame).reset_index(drop=True) if reference_frame is not None else frame
     periods = vintage_labels(frame[date_col], freq=freq)
     counts = periods.value_counts(dropna=True)
     kept = sorted([p for p in counts.index if counts[p] >= min_rows_per_vintage], key=str)
@@ -192,13 +201,32 @@ def predictor_stability(
 
     def _one(feature):
         # type: (str) -> Dict[str, Any]
+        from scorecard_segment_eval.binning import MISSING_LABEL, _is_logit_spec
+        from scorecard_segment_eval.characteristics import quantile_bin_labels
+
         spec = grouping.specs.get(feature)
         if spec is None:
             return _empty_stability_row(feature, ["no_grouping"])
-        labels_all = spec.assign(frame[feature])
+        is_logit = _is_logit_spec(spec)
+        binning = "grouping"
+        n_bins = int(getattr(gates, "n_woe_bins", 10) or 10)
+        if is_logit:
+            ref_vals = overall[feature] if feature in overall.columns else frame[feature]
+            labels_all, order = quantile_bin_labels(frame[feature], ref_vals, n_bins=n_bins)
+            labels_overall, _order_ref = quantile_bin_labels(ref_vals, ref_vals, n_bins=n_bins)
+            if MISSING_LABEL not in order:
+                order = list(order) + [MISSING_LABEL]
+            binning = "logit_quantiles"
+            psi_reference = labels_overall
+        else:
+            labels_all = spec.assign(frame[feature])
+            order = list(spec.bin_order())
+            if spec.missing_label not in order:
+                order.append(spec.missing_label)
+            psi_reference = labels_all
         woe_all = spec.transform_woe(frame[feature])
-        order = spec.bin_order()
-        ref_gini = gini(y_all, -woe_all)
+        score_all = woe_all if is_logit else -woe_all
+        ref_gini = gini(y_all, score_all)
         ref_iv = float(spec.iv)
         ref_sign = _slope_sign(woe_all, y_all)
         if len(kept) < max(int(gates.stability_min_vintages), 2):
@@ -206,6 +234,7 @@ def predictor_stability(
             row["n_vintages"] = len(kept)
             row["gini_reference"] = ref_gini
             row["iv_reference"] = ref_iv
+            row["stability_binning"] = binning
             return row
         if not np.isfinite(ref_gini) or abs(ref_gini) < float(gates.stability_min_reference_gini):
             # A predictor with no univariate signal has no stability to speak
@@ -215,6 +244,7 @@ def predictor_stability(
             row["n_vintages"] = len(kept)
             row["gini_reference"] = ref_gini
             row["iv_reference"] = ref_iv
+            row["stability_binning"] = binning
             return row
 
         psis = []  # type: List[float]
@@ -230,12 +260,13 @@ def predictor_stability(
             y_v = y_all[mask]
             labels_v = labels_all[mask]
             woe_v = woe_all[mask]
-            psis.append(psi_from_labels(labels_v, labels_all, order=order)["psi"])
-            g_v = gini(y_v, -woe_v)
+            score_v = woe_v if is_logit else -woe_v
+            psis.append(psi_from_labels(labels_v, psi_reference, order=order)["psi"])
+            g_v = gini(y_v, score_v)
             ginis.append(g_v)
             ivs.append(_iv_from_labels(labels_v, y_v, order))
             signs.append(_slope_sign(woe_v, y_v))
-            se_v = gini_standard_error(y_v, -woe_v)
+            se_v = gini_standard_error(y_v, score_v)
             if not np.isfinite(g_v):
                 weak.append(False)
             else:
@@ -312,6 +343,7 @@ def predictor_stability(
             "stability_score": score,
             "stable": not flags,
             "stability_flags": ",".join(flags),
+            "stability_binning": binning,
         }
 
     jobs = n_jobs if n_jobs is not None else gates.n_jobs

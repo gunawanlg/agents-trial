@@ -65,6 +65,9 @@ def test_result_carries_stability_and_meta():
     result = evaluate_segments(df, cols, gates, n_jobs=1)
     assert not result.stability.empty
     assert set(result.stability["segment_col"]) >= {"__overall__"}
+    assert set(result.vintage["segment_col"]) >= {"__overall__"}
+    overall_vint = result.vintage.loc[result.vintage["segment_col"].eq("__overall__")]
+    assert (overall_vint["segment_value"] == "ALL").all()
     assert result.meta["n_rows"] == len(df)
     assert result.meta["overall_gini"] == result.segment_summary.iloc[0]["gini"]
     assert result.meta["gates"]["min_n"] == gates.min_n
