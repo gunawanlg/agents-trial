@@ -593,8 +593,9 @@ def refit_with_diagnostics(
     segment_col=None,
     segment_value=None,
     logit_cols=None,
+    pred_val_map=None,
 ):
-    # type: (pd.DataFrame, pd.DataFrame, Sequence[str], str, Optional[Gates], bool, Optional[Dict[str, Any]], Optional[str], Optional[BinningModel], Optional[int], Optional[BinningModel], Optional[Dict[str, str]], Optional[pd.DataFrame], Optional[Sequence[str]], Optional[str], Any, Optional[Sequence[str]]) -> RefitResult
+    # type: (pd.DataFrame, pd.DataFrame, Sequence[str], str, Optional[Gates], bool, Optional[Dict[str, Any]], Optional[str], Optional[BinningModel], Optional[int], Optional[BinningModel], Optional[Dict[str, str]], Optional[pd.DataFrame], Optional[Sequence[str]], Optional[str], Any, Optional[Sequence[str]], Optional[Dict[str, str]]) -> RefitResult
     """Refit on ``train``, score ``holdout``, and diagnose predictor stability.
 
     The grouping is fitted on the training rows only (or reused when supplied),
@@ -718,6 +719,7 @@ def refit_with_diagnostics(
         grouping=grouping,
         n_jobs=n_jobs,
         reference_frame=reference,
+        pred_val_map=pred_val_map,
     )
     summary = stability_summary(stability, gates=gates)
     result = RefitResult(
@@ -752,8 +754,9 @@ def refit_same_predictors(
     portfolio_frame=None,
     cols_pred_woe=None,
     logit_cols=None,
+    pred_val_map=None,
 ):
-    # type: (pd.DataFrame, pd.DataFrame, Sequence[str], str, Gates, bool, Optional[Dict[str, Any]], Optional[str], Optional[BinningModel], Optional[int], Optional[BinningModel], Optional[Dict[str, str]], Optional[pd.DataFrame], Optional[Sequence[str]], Optional[Sequence[str]]) -> np.ndarray
+    # type: (pd.DataFrame, pd.DataFrame, Sequence[str], str, Gates, bool, Optional[Dict[str, Any]], Optional[str], Optional[BinningModel], Optional[int], Optional[BinningModel], Optional[Dict[str, str]], Optional[pd.DataFrame], Optional[Sequence[str]], Optional[Sequence[str]], Optional[Dict[str, str]]) -> np.ndarray
     """Holdout PDs from a same-predictor refit (unchanged return contract)."""
     result = refit_with_diagnostics(
         train,
@@ -771,6 +774,7 @@ def refit_same_predictors(
         portfolio_frame=portfolio_frame,
         cols_pred_woe=cols_pred_woe,
         logit_cols=logit_cols,
+        pred_val_map=pred_val_map,
     )
     return result.p_holdout
 
