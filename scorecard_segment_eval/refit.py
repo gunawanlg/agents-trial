@@ -50,6 +50,7 @@ MODEL_FILENAME = "model.pkl"
 GROUPING_FILENAME = "grouping.json"
 META_FILENAME = "meta.json"
 COMPARISON_FILENAME = "grouping_comparison.json"
+SCORECARD_FILENAME = "scorecard.sql"
 
 #: Absolute ceiling on sub-model depth; callers may lower it, never raise it.
 MAX_SUBMODEL_DEPTH = 3
@@ -231,8 +232,8 @@ class FittedModelArtifact:
 
     ``kind`` is ``"refit"`` (new WoE bins + LR/XGBoost) or ``"recalibrate"``
     (two-parameter logistic rescale of an existing PD).  :meth:`save` writes
-    a directory containing ``grouping.json``, ``model.pkl`` and ``meta.json``
-    so the user can reload the exact transformation and model.
+    a directory containing ``grouping.json``, ``model.pkl``, ``meta.json``
+    and, for logistic refits, a production-shaped ``scorecard.sql``.
     """
 
     kind: str
@@ -293,6 +294,42 @@ class FittedModelArtifact:
             "grouping_comparison": comparison,
         }
 
+    def _should_write_scorecard_sql(self):
+        # type: () -> bool
+        if self.kind == "recalibrate":
+            return False
+        if self.method == "xgboost_submodel":
+            return False
+        if self.grouping is None or not self.grouping.columns:
+            return False
+        return True
+
+    def to_scorecard_sql(self, table="_SOURCETABLENAME_", score_alias="SCORE"):
+        # type: (str, str) -> str
+        """Render this artefact as production scorecard SQL (CASE WHEN + sigmoid)."""
+        from scorecard_segment_eval.sql_model import render_scorecard_sql
+
+        if not self._should_write_scorecard_sql():
+            raise ValueError(
+                "cannot render scorecard SQL for kind=%s method=%s" % (self.kind, self.method)
+            )
+        coefficients = dict(self.coefficients or {})
+        if "__intercept__" not in coefficients and self.model is not None:
+            intercept = getattr(self.model, "intercept_", None)
+            if intercept is not None:
+                coefficients["__intercept__"] = float(np.asarray(intercept).reshape(-1)[0])
+            coef = getattr(self.model, "coef_", None)
+            if coef is not None and self.grouping is not None:
+                for name, val in zip(self.grouping.columns, np.asarray(coef).reshape(-1)):
+                    coefficients.setdefault(name, float(val))
+        return render_scorecard_sql(
+            self.grouping,
+            coefficients,
+            table=table,
+            score_alias=score_alias,
+            pred_woe_map=self.pred_woe_map,
+        )
+
     def save(self, directory):
         # type: (str) -> str
         """Write the grouping, the estimator and metadata into ``directory``."""
@@ -309,6 +346,9 @@ class FittedModelArtifact:
             records = json.loads(self.grouping_comparison.to_json(orient="records"))
             with open(os.path.join(directory, COMPARISON_FILENAME), "w") as handle:
                 json.dump(records, handle, indent=2)
+        if self._should_write_scorecard_sql():
+            with open(os.path.join(directory, SCORECARD_FILENAME), "w") as handle:
+                handle.write(self.to_scorecard_sql())
         return directory
 
     @classmethod
