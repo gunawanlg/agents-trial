@@ -263,3 +263,36 @@ def test_condensed_html_escapes_values():
     html = render_condensed_html_report(res)
     assert "<script>alert(1)</script>" not in html
     assert "&lt;script&gt;" in html
+
+
+def test_condensed_recalibrate_groups_values_under_segment_col():
+    from scorecard_segment_eval.condensed_report import _grouped_next_actions
+
+    recs = pd.DataFrame(
+        [
+            {
+                "rank": 1,
+                "priority": 1,
+                "action": "RECALIBRATE",
+                "segment_col": "channel",
+                "segment_value": "miscal",
+                "recommendation": "Recalibrate the PD level of channel = miscal.",
+                "why": "why-a",
+                "evidence": "e1",
+            },
+            {
+                "rank": 2,
+                "priority": 1,
+                "action": "RECALIBRATE",
+                "segment_col": "channel",
+                "segment_value": "shift",
+                "recommendation": "Recalibrate the PD level of channel = shift.",
+                "why": "why-b",
+                "evidence": "e2",
+            },
+        ]
+    )
+    html = _grouped_next_actions(recs)
+    assert html.count("Recalibrate the PD level for") == 1
+    assert "miscal, shift" in html
+    assert html.count("RECALIBRATE") == 1
