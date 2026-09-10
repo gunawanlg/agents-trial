@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -163,9 +165,20 @@ def test_evaluate_keeps_fitted_artifacts_and_grouping_notes(tmp_path):
     ).any()
     written = result.save_artifacts(str(tmp_path / "artifacts"))
     assert written
-    from scorecard_segment_eval.refit import load_fitted_artifact
+    from scorecard_segment_eval.refit import SCORECARD_FILENAME, load_fitted_artifact
+    from scorecard_segment_eval.sql_model import parse_scorecard_sql_path
 
     reloaded = load_fitted_artifact(written[0])
     assert reloaded.kind in ("refit", "recalibrate")
     assert reloaded.model is not None or reloaded.kind == "recalibrate"
+    refit_sql = None
+    for path in written:
+        art = load_fitted_artifact(path)
+        if art.kind == "refit" and str(art.method).startswith("logistic"):
+            sql_path = os.path.join(path, SCORECARD_FILENAME)
+            assert os.path.isfile(sql_path)
+            refit_sql = parse_scorecard_sql_path(sql_path)
+            assert refit_sql.grouping is not None
+            break
+    assert refit_sql is not None
 

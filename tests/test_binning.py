@@ -224,6 +224,8 @@ def test_vintage_stability_table_empty_without_date_or_spec():
 def test_plot_vintage_stability_three_subplots():
     matplotlib = pytest.importorskip("matplotlib")
     matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+
     frame = _dated_book(n=2500, seed=8)
     model = BinningModel.fit(frame[["x"]], frame["y"], Gates())
     fig, axes = model.plot_vintage_stability(
@@ -231,9 +233,23 @@ def test_plot_vintage_stability_three_subplots():
     )
     assert fig is not None
     assert len(axes) == 3
+    gs = axes[0].get_gridspec()
+    assert gs.nrows == 1 and gs.ncols == 3
     assert axes[0].get_ylabel() == "event rate"
     assert axes[1].get_ylabel() == "share"
     assert axes[2].get_ylabel() == "univariate Gini"
+    legend = axes[0].get_legend()
+    assert legend is not None
+    legend_texts = [t.get_text() for t in legend.get_texts()]
+    assert MISSING_LABEL in legend_texts
+    line = axes[0].get_lines()[0]
+    x_num = np.asarray(mdates.date2num(line.get_xdata()), dtype=float)
+    assert np.nanmax(x_num) > 1000
+    formatter = axes[0].xaxis.get_major_formatter()
+    assert isinstance(
+        formatter,
+        (mdates.ConciseDateFormatter, mdates.DateFormatter, mdates.AutoDateFormatter),
+    )
 
 
 def test_overlapping_event_rate_bounds_are_merged():

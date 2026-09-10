@@ -1,3 +1,4 @@
+import os
 import warnings
 
 import numpy as np
@@ -8,6 +9,7 @@ from scorecard_segment_eval.binning import BinningModel, BinSpec
 from scorecard_segment_eval.metrics import gini
 from scorecard_segment_eval.refit import (
     MAX_SUBMODEL_DEPTH,
+    SCORECARD_FILENAME,
     FittedModelArtifact,
     WoEEncoder,
     fit_submodel,
@@ -220,6 +222,13 @@ def test_refit_keeps_the_model_and_grouping_and_round_trips(tmp_path):
     )
     assert reloaded.grouping is not None
     assert reloaded.method == "logistic_woe"
+    sql_path = os.path.join(directory, SCORECARD_FILENAME)
+    assert os.path.isfile(sql_path)
+    from scorecard_segment_eval.sql_model import parse_scorecard_sql_path
+
+    parsed = parse_scorecard_sql_path(sql_path)
+    assert parsed.grouping is not None
+    assert set(parsed.grouping.columns) == set(result.grouping.columns)
 
 
 def test_refit_notes_differences_against_the_portfolio_grouping():

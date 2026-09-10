@@ -59,6 +59,7 @@ from scorecard_segment_eval.sql_model import (
     ScorecardSQLModel,
     parse_scorecard_sql,
     parse_scorecard_sql_path,
+    render_scorecard_sql,
 )
 from scorecard_segment_eval.smartdata import (
     CapabilityReport,
@@ -89,6 +90,7 @@ __all__ = [
     "ScorecardSQLModel",
     "parse_scorecard_sql",
     "parse_scorecard_sql_path",
+    "render_scorecard_sql",
     # evaluation
     "SegmentEvalResult",
     "evaluate_segments",

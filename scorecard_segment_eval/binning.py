@@ -861,6 +861,22 @@ def _finalise_stats(spec, series, y_arr):
         spec.events.setdefault(label, 0.0)
 
 
+def _vintage_axis_values(vintages):
+    # type: (Sequence[str]) -> Tuple[List[Any], bool]
+    """Parse vintage labels to timestamps when every label is date-like."""
+    parsed = []  # type: List[Any]
+    for value in vintages:
+        ts = None  # type: Any
+        try:
+            ts = pd.Period(str(value)).to_timestamp()
+        except Exception:
+            ts = pd.to_datetime(str(value), errors="coerce")
+        if ts is None or pd.isna(ts):
+            return list(range(len(vintages))), False
+        parsed.append(pd.Timestamp(ts).to_pydatetime())
+    return parsed, True
+
+
 # --------------------------------------------------------------------------
 # Model over many predictors
 # --------------------------------------------------------------------------
@@ -1048,14 +1064,17 @@ class BinningModel(object):
         figsize=None,
     ):
         # type: (pd.DataFrame, Any, str, str, str, int, Optional[Tuple[float, float]]) -> Tuple[Any, Any]
-        """Three stacked subplots of WoE grouping stability over vintages.
+        """One row of three subplots of WoE grouping stability over vintages.
 
-        Top: true event rate by bin.  Middle: bin share.  Bottom: univariate
-        Gini of the transformed predictor.  Requires the optional ``plot``
-        extra (``matplotlib``).
+        Left: true event rate by bin.  Middle: bin share.  Right: univariate
+        Gini of the transformed predictor.  The ``__missing__`` bin stays in
+        the legend even when every vintage has ``n=0`` for it.  Requires the
+        optional ``plot`` extra (``matplotlib``).
         """
         try:
             import matplotlib.pyplot as plt
+            import matplotlib.dates as mdates
+            from matplotlib.lines import Line2D
         except Exception:
             raise ImportError(
                 "plot_vintage_stability requires matplotlib; install with: "
@@ -1074,15 +1093,29 @@ class BinningModel(object):
             text = str(value)
             if text not in vintages:
                 vintages.append(text)
-        x_pos = list(range(len(vintages)))
+        spec = self.specs.get(feature)
         bins = []  # type: List[str]
+        if spec is not None:
+            for label in spec.bin_order():
+                text = str(label)
+                if text not in bins:
+                    bins.append(text)
+            missing = str(spec.missing_label or MISSING_LABEL)
+            if missing not in bins:
+                bins.append(missing)
         for value in table["bin"].tolist():
             text = str(value)
             if text not in bins:
                 bins.append(text)
+        if MISSING_LABEL not in bins:
+            bins.append(MISSING_LABEL)
+        x_vals, use_dates = _vintage_axis_values(vintages)
         fig, axes = plt.subplots(
-            3, 1, sharex=True, figsize=figsize or (10.0, 8.0)
+            1, 3, sharex=True, figsize=figsize or (14.0, 4.0)
         )
+        axes = np.atleast_1d(axes).ravel()
+        legend_handles = []
+        legend_labels = []
         for bin_label in bins:
             part = table.loc[table["bin"].astype(str) == bin_label]
             by_v = dict(
@@ -1093,12 +1126,28 @@ class BinningModel(object):
                 float(by_v[v]["event_rate"]) if v in by_v else float("nan")
                 for v in vintages
             ]
-            shares = [
-                float(by_v[v]["share"]) if v in by_v else float("nan")
-                for v in vintages
-            ]
-            axes[0].plot(x_pos, rates, marker="o", label=bin_label)
-            axes[1].plot(x_pos, shares, marker="o", label=bin_label)
+            shares = []
+            for v in vintages:
+                if v in by_v:
+                    shares.append(float(by_v[v]["share"]))
+                elif bin_label == MISSING_LABEL:
+                    shares.append(0.0)
+                else:
+                    shares.append(float("nan"))
+            line = axes[0].plot(x_vals, rates, marker="o", label=bin_label)[0]
+            axes[1].plot(x_vals, shares, marker="o", label=bin_label)
+            handle = line
+            y_arr = np.asarray(rates, dtype=float)
+            if not np.any(np.isfinite(y_arr)):
+                handle = Line2D(
+                    [0],
+                    [0],
+                    color=line.get_color(),
+                    marker="o",
+                    linestyle=line.get_linestyle(),
+                )
+            legend_handles.append(handle)
+            legend_labels.append(bin_label)
         gini_by_v = table.drop_duplicates("vintage")
         gini_lookup = dict(
             (str(row["vintage"]), float(row["univariate_gini"]))
@@ -1107,19 +1156,36 @@ class BinningModel(object):
         ginis = [
             gini_lookup[v] if v in gini_lookup else float("nan") for v in vintages
         ]
-        axes[2].plot(x_pos, ginis, marker="o", color="black")
+        axes[2].plot(x_vals, ginis, marker="o", color="black")
         axes[0].set_ylabel("event rate")
         axes[1].set_ylabel("share")
         axes[2].set_ylabel("univariate Gini")
-        axes[2].set_xlabel("vintage")
         axes[0].set_title("%s — true event rate" % feature)
         axes[1].set_title("bin share")
         axes[2].set_title("univariate Gini")
         axes[1].set_ylim(0.0, 1.0)
-        axes[2].set_xticks(x_pos)
-        axes[2].set_xticklabels(vintages, rotation=45, ha="right")
-        if len(bins) <= 12:
-            axes[0].legend(loc="best", fontsize="small", ncol=2)
+        for ax in axes:
+            ax.set_xlabel("vintage")
+        if use_dates:
+            locator = mdates.AutoDateLocator(minticks=3, maxticks=8)
+            try:
+                formatter = mdates.ConciseDateFormatter(locator)
+            except Exception:
+                formatter = mdates.DateFormatter("%Y-%m")
+            for ax in axes:
+                ax.xaxis.set_major_locator(locator)
+                ax.xaxis.set_major_formatter(formatter)
+                ax.tick_params(axis="x", labelrotation=0)
+        else:
+            axes[2].set_xticks(x_vals)
+            axes[2].set_xticklabels(vintages, rotation=45, ha="right")
+        if MISSING_LABEL not in [str(lab) for lab in legend_labels]:
+            legend_handles.append(Line2D([0], [0], marker="o"))
+            legend_labels.append(MISSING_LABEL)
+        if len(legend_labels) <= 12:
+            axes[0].legend(
+                legend_handles, legend_labels, loc="best", fontsize="small", ncol=2
+            )
         fig.tight_layout()
         return fig, axes
 

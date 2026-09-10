@@ -17,7 +17,7 @@ from scorecard_segment_eval.smartdata import (
     build_analysis_frame,
     resolve_metadata,
 )
-from scorecard_segment_eval.sql_model import parse_scorecard_sql_path
+from scorecard_segment_eval.sql_model import parse_scorecard_sql, parse_scorecard_sql_path, render_scorecard_sql
 
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "sample_scorecard.sql")
@@ -319,3 +319,65 @@ def test_build_analysis_frame_scores_from_sql():
     )
     expected = parsed.predict_proba(base)[:, 1]
     np.testing.assert_allclose(frame["SCORE"].to_numpy(dtype=float), expected)
+
+
+def test_render_round_trips_sample_sql():
+    parsed = _sample_model()
+    sql = parsed.to_sql()
+    assert "as LINEAR_SCORE" in sql
+    assert "1/(1+exp(-s.LINEAR_SCORE))" in sql
+    assert "from _SOURCETABLENAME_" in sql
+    again = parse_scorecard_sql(sql)
+    assert again.cols_pred == parsed.cols_pred
+    assert again.cols_pred_woe == parsed.cols_pred_woe
+    assert again.pred_map == parsed.pred_map
+    assert again.intercept == pytest.approx(parsed.intercept)
+    for name, coef in parsed.coefficients.items():
+        assert again.coefficients[name] == pytest.approx(coef)
+    orig_a = parsed.grouping.specs["indosat_v2"]
+    new_a = again.grouping.specs["indosat_v2"]
+    assert orig_a.edges[0] == new_a.edges[0]
+    assert orig_a.edges[-1] == new_a.edges[-1]
+    for left, right in zip(orig_a.edges[1:-1], new_a.edges[1:-1]):
+        assert left == pytest.approx(right)
+    feat_e = again.grouping.specs["featE"]
+    assert feat_e.kind == "logit"
+    assert feat_e.impute == pytest.approx(parsed.grouping.specs["featE"].impute)
+    feat_f = again.grouping.specs["featF_v3_0"]
+    assert feat_f.kind == "logit"
+    assert feat_f.impute is None
+
+
+def test_render_scorecard_sql_from_fitted_grouping(tmp_path):
+    rng = np.random.default_rng(4)
+    n = 800
+    x = rng.normal(size=n)
+    logit = -1.5 + 1.2 * x
+    y = rng.binomial(1, 1.0 / (1.0 + np.exp(-logit)))
+    frame = pd.DataFrame({"x": x, "y": y})
+    from scorecard_segment_eval.binning import BinningModel
+    from scorecard_segment_eval.schema import Gates
+
+    grouping = BinningModel.fit(frame[["x"]], frame["y"], Gates())
+    coefficients = {"x": -0.7, "__intercept__": -1.2}
+    sql = render_scorecard_sql(grouping, coefficients)
+    parsed = parse_scorecard_sql(sql)
+    assert parsed.pred_map["x"] == "x_WOE"
+    assert parsed.coefficients["x_WOE"] == pytest.approx(-0.7)
+    assert parsed.intercept == pytest.approx(-1.2)
+    path = str(tmp_path / "scorecard.sql")
+    with open(path, "w") as handle:
+        handle.write(sql)
+    reloaded = parse_scorecard_sql_path(path)
+    assert reloaded.grouping.specs["x"].edges is not None
+
+
+def test_sql_artifact_save_writes_scorecard_sql(tmp_path):
+    parsed = _sample_model()
+    directory = str(tmp_path / "pooled")
+    parsed.to_artifact().save(directory)
+    sql_path = os.path.join(directory, "scorecard.sql")
+    assert os.path.isfile(sql_path)
+    again = parse_scorecard_sql_path(sql_path)
+    assert again.pred_map["indosat_v2"] == "feature_a_WOE"
+    assert again.intercept == pytest.approx(parsed.intercept)

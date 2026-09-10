@@ -23,6 +23,10 @@ needs (``cols_pred``, ``cols_pred_woe``, ``cols_pred_used``), a grouping
 definition with the SQL null-imputation values, a scikit-learn
 :class:`~sklearn.linear_model.LogisticRegression` whose ``coef_`` / ``intercept_``
 reproduce ``LINEAR_SCORE = B^T X``, and a human-readable formula.
+
+:func:`render_scorecard_sql` writes the same query shape from a fitted
+:class:`~scorecard_segment_eval.binning.BinningModel` and coefficient map, so
+refit artefacts can ship a ``scorecard.sql`` next to ``grouping.json``.
 """
 
 import os
@@ -461,6 +465,18 @@ class ScorecardSQLModel:
             out[score_col] = 1.0 / (1.0 + np.exp(-np.clip(linear, -30.0, 30.0)))
         return out
 
+    def to_sql(self, table=None, score_alias=None):
+        # type: (Optional[str], Optional[str]) -> str
+        """Render this model back into the production scorecard SQL shape."""
+        return render_scorecard_sql(
+            self.grouping,
+            self.coefficients,
+            table=table or self.source_table or "_SOURCETABLENAME_",
+            score_alias=score_alias or self.score_alias or "SCORE",
+            pred_map=self.pred_map,
+            intercept=self.intercept,
+        )
+
     def to_dict(self):
         # type: () -> Dict[str, Any]
         return {
@@ -563,3 +579,273 @@ def parse_scorecard_sql_path(path):
     # type: (str) -> ScorecardSQLModel
     with open(path, "r") as handle:
         return parse_scorecard_sql(handle.read())
+
+
+def _sql_number(value):
+    # type: (Any) -> str
+    number = float(value)
+    if not np.isfinite(number):
+        return "0"
+    text = format(number, ".17g")
+    if text == "-0":
+        return "0"
+    return text
+
+
+def _sql_literal(value):
+    # type: (Any) -> str
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and not np.isfinite(value):
+            return "0"
+        return _sql_number(value)
+    text = str(value).replace("'", "''")
+    return "'%s'" % text
+
+
+def _sql_ident(name):
+    # type: (str) -> str
+    text = str(name)
+    if re.match(r"^[A-Za-z_][\w]*$", text):
+        return text
+    return '"%s"' % text.replace('"', '""')
+
+
+def _output_alias(spec, pred_map):
+    # type: (BinSpec, Dict[str, str]) -> str
+    if spec.output_name:
+        return str(spec.output_name)
+    mapped = pred_map.get(spec.feature)
+    if mapped:
+        return str(mapped)
+    if spec.kind == "logit" or spec.transform == "logit":
+        return "%s_VAL" % spec.feature
+    return "%s_WOE" % spec.feature
+
+
+def _coef_for(coefficients, *names):
+    # type: (Dict[str, float], str) -> Optional[float]
+    for name in names:
+        if name in coefficients:
+            return float(coefficients[name])
+    return None
+
+
+def _missing_woe(spec):
+    # type: (BinSpec) -> float
+    if spec.impute is not None:
+        return float(spec.impute)
+    if MISSING_LABEL in spec.woe:
+        return float(spec.woe[MISSING_LABEL])
+    if OTHER_LABEL in spec.woe:
+        return float(spec.woe[OTHER_LABEL])
+    return 0.0
+
+
+def _else_woe(spec):
+    # type: (BinSpec) -> float
+    if OTHER_LABEL in spec.woe:
+        return float(spec.woe[OTHER_LABEL])
+    return _missing_woe(spec)
+
+
+def _when_from_rule(col, rule):
+    # type: (str, Dict[str, Any]) -> Optional[str]
+    op = str(rule.get("op", "")).lower()
+    woe = _sql_number(rule.get("woe", 0.0))
+    ident = _sql_ident(col)
+    if op == "eq":
+        return "when %s = %s then %s" % (ident, _sql_literal(rule.get("value")), woe)
+    if op == "lt":
+        return "when %s < %s then %s" % (ident, _sql_number(rule["threshold"]), woe)
+    if op == "le":
+        return "when %s <= %s then %s" % (ident, _sql_number(rule["threshold"]), woe)
+    if op == "gt":
+        return "when %s > %s then %s" % (ident, _sql_number(rule["threshold"]), woe)
+    if op == "ge":
+        return "when %s >= %s then %s" % (ident, _sql_number(rule["threshold"]), woe)
+    if op == "null":
+        return "when %s is null then %s" % (ident, woe)
+    if op == "else":
+        return "else %s" % woe
+    return None
+
+
+def _numeric_whens(spec):
+    # type: (BinSpec) -> List[str]
+    lines = []  # type: List[str]
+    edges = spec.edges or []
+    labels = list(spec.labels)
+    finite = [float(e) for e in edges[1:-1]] if len(edges) >= 2 else []
+    ident = _sql_ident(spec.feature)
+    closed = spec.closed or "right"
+    if not finite:
+        return lines
+    if closed == "left":
+        for i, cut in enumerate(finite):
+            label = labels[i] if i < len(labels) else None
+            woe = spec.woe.get(label, 0.0) if label is not None else 0.0
+            lines.append("when %s < %s then %s" % (ident, _sql_number(cut), _sql_number(woe)))
+        last_i = len(finite)
+        last_label = labels[last_i] if last_i < len(labels) else (labels[-1] if labels else None)
+        woe = spec.woe.get(last_label, 0.0) if last_label is not None else 0.0
+        lines.append(
+            "when %s >= %s then %s" % (ident, _sql_number(finite[-1]), _sql_number(woe))
+        )
+    else:
+        for i, cut in enumerate(finite):
+            label = labels[i] if i < len(labels) else None
+            woe = spec.woe.get(label, 0.0) if label is not None else 0.0
+            lines.append("when %s <= %s then %s" % (ident, _sql_number(cut), _sql_number(woe)))
+        last_i = len(finite)
+        last_label = labels[last_i] if last_i < len(labels) else (labels[-1] if labels else None)
+        woe = spec.woe.get(last_label, 0.0) if last_label is not None else 0.0
+        lines.append(
+            "when %s > %s then %s" % (ident, _sql_number(finite[-1]), _sql_number(woe))
+        )
+    return lines
+
+
+def _categorical_whens(spec):
+    # type: (BinSpec) -> List[str]
+    lines = []  # type: List[str]
+    ident = _sql_ident(spec.feature)
+    for label, members in (spec.groups or {}).items():
+        woe = spec.woe.get(label, 0.0)
+        for member in members:
+            lines.append(
+                "when %s = %s then %s" % (ident, _sql_literal(member), _sql_number(woe))
+            )
+    return lines
+
+
+def _spec_to_case(spec, alias):
+    # type: (BinSpec, str) -> str
+    ident = _sql_ident(spec.feature)
+    alias_sql = _sql_ident(alias)
+    if spec.kind == "logit" or spec.transform == "logit":
+        logit_expr = "LN(%s/(1-%s))" % (ident, ident)
+        if spec.impute is not None:
+            then_expr = "nvl(%s,%s)" % (logit_expr, _sql_number(spec.impute))
+        else:
+            then_expr = logit_expr
+        body = [
+            "when 1=1 then %s" % then_expr,
+            "else 0",
+        ]
+    elif spec.rules:
+        body = []
+        saw_else = False
+        saw_null = False
+        for rule in spec.rules:
+            line = _when_from_rule(spec.feature, rule)
+            if line is None:
+                continue
+            if line.startswith("else"):
+                saw_else = True
+            if " is null then " in line:
+                saw_null = True
+            body.append(line)
+        if not saw_null:
+            body.append("when %s is null then %s" % (ident, _sql_number(_missing_woe(spec))))
+        if not saw_else:
+            body.append("else %s" % _sql_number(_else_woe(spec)))
+    else:
+        body = []
+        if spec.kind in ("categorical", "mixed"):
+            body.extend(_categorical_whens(spec))
+        if spec.kind in ("numeric", "mixed") and spec.edges is not None:
+            body.extend(_numeric_whens(spec))
+        body.append("when %s is null then %s" % (ident, _sql_number(_missing_woe(spec))))
+        body.append("else %s" % _sql_number(_else_woe(spec)))
+    inner = "\n            ".join(body)
+    return "        case\n            %s\n        end as %s" % (inner, alias_sql)
+
+
+def _intercept_case():
+    # type: () -> str
+    return (
+        "        case\n"
+        "            when 1=1 then 1.0\n"
+        "            else 0\n"
+        "        end as Intercept"
+    )
+
+
+def _linear_sql(terms, intercept):
+    # type: (Sequence[Tuple[str, float]], float) -> str
+    if not terms:
+        return "    w.Intercept * %s" % _sql_number(intercept)
+    lines = []
+    for i, (alias, coef) in enumerate(terms):
+        piece = "w.%s * %s" % (_sql_ident(alias), _sql_number(coef))
+        if i == 0:
+            lines.append("    %s" % piece)
+        else:
+            lines.append("     + %s" % piece)
+    lines.append("     + w.Intercept * %s" % _sql_number(intercept))
+    return "\n".join(lines)
+
+
+def render_scorecard_sql(
+    grouping,
+    coefficients=None,
+    table="_SOURCETABLENAME_",
+    score_alias="SCORE",
+    pred_map=None,
+    pred_woe_map=None,
+    intercept=None,
+):
+    # type: (Optional[BinningModel], Optional[Dict[str, float]], str, str, Optional[Dict[str, str]], Optional[Dict[str, str]], Optional[float]) -> str
+    """Write a production-shaped scorecard SQL string from a grouping and betas.
+
+    The query matches :file:`tests/fixtures/sample_scorecard.sql`: an inner
+    CASE WHEN select of WoE / VAL columns, a linear combination named
+    ``LINEAR_SCORE``, and an outer sigmoid aliased as ``SCORE``.
+    """
+    if grouping is None:
+        raise ValueError("render_scorecard_sql requires a grouping")
+    coefficients = dict(coefficients or {})
+    mapping = dict(pred_map or {})
+    mapping.update(pred_woe_map or {})
+    for spec in grouping.specs.values():
+        if spec.output_name and spec.feature not in mapping:
+            mapping[spec.feature] = spec.output_name
+
+    intercept_val = intercept
+    if intercept_val is None:
+        found = _coef_for(coefficients, "__intercept__", "Intercept", "intercept")
+        intercept_val = 0.0 if found is None else found
+
+    columns = list(grouping.columns) if grouping.columns else list(grouping.specs.keys())
+    cases = []
+    terms = []  # type: List[Tuple[str, float]]
+    for feature in columns:
+        spec = grouping.specs.get(feature)
+        if spec is None:
+            continue
+        alias = _output_alias(spec, mapping)
+        cases.append(_spec_to_case(spec, alias))
+        coef = _coef_for(coefficients, alias, feature)
+        terms.append((alias, 0.0 if coef is None else coef))
+    cases.append(_intercept_case())
+
+    inner = ",\n".join(cases)
+    linear = _linear_sql(terms, float(intercept_val))
+    source = table or "_SOURCETABLENAME_"
+    score = _sql_ident(score_alias or "SCORE")
+    return (
+        "select\n"
+        "1/(1+exp(-s.LINEAR_SCORE)) as %s,\n"
+        "s.*\n"
+        "from (\n"
+        "    select\n"
+        "%s\n"
+        "    as LINEAR_SCORE,\n"
+        "    w.*\n"
+        "    from (\n"
+        "        select\n"
+        "%s\n"
+        "        from %s\n"
+        "    ) w\n"
+        ") s\n"
+    ) % (score, linear, inner, source)
