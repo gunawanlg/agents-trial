@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from scorecard_segment_eval.binning import BinningModel
+from scorecard_segment_eval.binning import MISSING_LABEL, BinningModel, BinSpec
 from scorecard_segment_eval.schema import Gates
 from scorecard_segment_eval.stability import (
     gini_standard_error,
@@ -155,3 +155,37 @@ def test_overlapping_event_rate_bounds_are_flagged():
     row = table.set_index("feature").loc["x"]
     assert "overlapping_event_rate_bounds" in str(row["stability_flags"])
     assert not bool(row["stable"])
+
+
+def test_logit_stability_uses_overall_quantiles_including_missing():
+    book = _monthly_book(n_months=18, n_per=200, seed=12)
+    overall = book.copy()
+    book = book.copy()
+    book.loc[book.index[:90], "x"] = np.nan
+    grouping = BinningModel(
+        specs={
+            "x": BinSpec(
+                feature="x",
+                kind="logit",
+                method="sql_logit",
+                transform="logit",
+                labels=["logit"],
+            )
+        }
+    )
+    table = predictor_stability(
+        book,
+        ["x"],
+        "y",
+        "date",
+        Gates(stability_min_reference_gini=0.0),
+        grouping=grouping,
+        reference_frame=overall,
+    )
+    row = table.set_index("feature").loc["x"]
+    assert row["stability_binning"] == "logit_quantiles"
+    from scorecard_segment_eval.characteristics import quantile_bin_labels
+
+    labels, order = quantile_bin_labels(book["x"], overall["x"])
+    assert MISSING_LABEL in order
+    assert MISSING_LABEL in set(str(v) for v in labels)
