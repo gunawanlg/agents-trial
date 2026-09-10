@@ -159,8 +159,9 @@ def test_overlapping_event_rate_bounds_are_flagged():
 
 def test_logit_stability_uses_overall_quantiles_including_missing():
     book = _monthly_book(n_months=18, n_per=200, seed=12)
-    overall = book.copy()
     book = book.copy()
+    book["x"] = 1.0 / (1.0 + np.exp(-book["x"]))
+    overall = book.copy()
     book.loc[book.index[:90], "x"] = np.nan
     grouping = BinningModel(
         specs={
@@ -170,6 +171,7 @@ def test_logit_stability_uses_overall_quantiles_including_missing():
                 method="sql_logit",
                 transform="logit",
                 labels=["logit"],
+                impute=-2.5,
             )
         }
     )
