@@ -214,16 +214,29 @@ def test_condensed_html_report_has_toc_frozen_tables_and_filters(result, tmp_pat
     assert 'id="sec-next"' in html
     assert "Recalibrate the PD level for" in html
     assert "channel" in html
+    assert "observed" in html
+    assert "expected" in html
     assert "How the matched-AR cutoff is simulated" in html
+    assert "ar_reference_cutoff" in html
+    assert "data-cutoff" in html
+    assert "id=\"ar-table\"" in html
     assert "gini_refit" in html
     assert "stability_reason" in html
     assert "scorecard.sql" in html
+    assert "portfolio_bin" in html
+    assert "flag_meaning" in html or "flag-viz" in html
+    assert "id=\"sec-gates\"" in html
+    assert "min_n" in html
     assert "class=\"idx\"" in html
     assert "class=\"idx2\"" in html
     assert "class=\"frozen\"" in html
     vintage_part = html.split('id="sec-vintage"', 1)[1]
-    assert "<table" not in vintage_part
-    assert "portfolio event rate" in vintage_part
+    gates_split = vintage_part.split('id="sec-gates"', 1)[0]
+    assert "<table" not in gates_split
+    assert "portfolio event rate" in gates_split
+    assert "event rate" in gates_split
+    assert "Gini" in gates_split
+    assert "O/E" not in gates_split
     path = save_report(
         res, str(tmp_path / "segment_evaluation_report_condensed.html"), gates=gates
     )

@@ -82,6 +82,8 @@ def test_summary_and_decisions_expose_matched_ar_columns():
     overall = result.segment_summary.iloc[0]
     assert overall["segment_value"] == "ALL"
     assert pd.isna(overall["gini_at_matched_ar"])
+    for key in ("obs_rate", "mean_pd", "ar_reference_cutoff"):
+        assert key in result.decisions.columns
 
 
 def test_characteristics_record_the_psi_method():
