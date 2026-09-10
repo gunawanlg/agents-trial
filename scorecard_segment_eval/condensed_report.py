@@ -27,9 +27,11 @@ from scorecard_segment_eval.report import (
     _badge,
     _cell,
     _decisions_with_refit,
+    _gates_block,
     _gates_from_result,
     _is_numeric_column,
     _kpis,
+    _pct,
     html_safe,
     recommendations,
 )
@@ -90,6 +92,21 @@ img.viz { max-width: 100%; height: auto; border: 1px solid var(--line); border-r
 .illus { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin: 10px 0 16px; overflow-x: auto; }
 .illus svg { display: block; max-width: 100%; }
 .values { font-family: ui-monospace, monospace; font-size: 12px; }
+.calib { font-size: 12px; margin-top: 8px; }
+table.frozen tr.clickable { cursor: pointer; }
+table.frozen tr.clickable:hover td,
+table.frozen tr.clickable:hover td.idx,
+table.frozen tr.clickable:hover td.idx2 { background: #ddf4ff; }
+table.frozen tr.clickable.selected td,
+table.frozen tr.clickable.selected td.idx,
+table.frozen tr.clickable.selected td.idx2 { background: #fff8c5; }
+dl.gates { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 2px 16px;
+           font-size: 12px; margin: 0; }
+dl.gates dt { font-weight: 600; color: var(--muted); }
+dl.gates dd { margin: 0 0 4px; font-variant-numeric: tabular-nums; }
+.flag-viz { min-width: 220px; }
+.flag-viz svg { display: block; }
+.flag-mean { font-size: 11px; color: var(--muted); margin-top: 4px; }
 """
 
 _TOC = (
@@ -100,7 +117,22 @@ _TOC = (
     ("sec-grouping", "Segment vs portfolio grouping"),
     ("sec-stability", "Predictor stability over vintages"),
     ("sec-vintage", "Vintage detail"),
+    ("sec-gates", "Gates used"),
 )
+
+_STABILITY_FLAG_MEANING = {
+    "distribution_drift": "Vintage PSI vs overall exceeds the PSI gate; the bin mix has shifted.",
+    "power_loss_in_vintage": "Too many vintages have univariate Gini below the noise-adjusted floor.",
+    "power_loss_median": "Median vintage Gini is below the reference Gini ratio floor.",
+    "sign_flip": "Too few vintages keep the same univariate sign as the reference.",
+    "low_stability_score": "The composite of drift, power persistence and sign agreement is below the gate.",
+    "overlapping_event_rate_bounds": "Adjacent bins have overlapping vintage event-rate confidence bounds.",
+    "insufficient_vintages": "Too few vintages to assess; this does not veto a refit.",
+    "no_reference_signal": "No univariate signal on the pooled sample; not allowed to veto a refit.",
+    "no_date_column": "No date column, so vintage stability was not assessed.",
+    "no_grouping": "No grouping for this predictor.",
+    "not_attempted": "Stability was not run for this segment.",
+}
 
 
 def _slug(*parts):
@@ -108,6 +140,45 @@ def _slug(*parts):
     text = "-".join("" if p is None else str(p) for p in parts)
     text = re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("_")
     return (text or "item")[:80]
+
+
+def _finite(value):
+    # type: (Any) -> bool
+    try:
+        return bool(np.isfinite(float(value)))
+    except (TypeError, ValueError):
+        return False
+
+
+def _js_num(value):
+    # type: (Any) -> str
+    if not _finite(value):
+        return "null"
+    return "%.6g" % (float(value),)
+
+
+def _calib_lookup(result):
+    # type: (Optional[SegmentEvalResult]) -> Dict[Tuple[str, str], Dict[str, Any]]
+    out = {}  # type: Dict[Tuple[str, str], Dict[str, Any]]
+    if result is None:
+        return out
+    frames = []
+    if result.decisions is not None and not result.decisions.empty:
+        frames.append(result.decisions)
+    summary = result.segment_summary
+    if summary is not None and not summary.empty:
+        if "slice" in summary.columns:
+            summary = summary.loc[summary["slice"].astype(str).eq("observable")]
+        frames.append(summary)
+    for frame in frames:
+        for _idx, row in frame.iterrows():
+            key = (str(row.get("segment_col")), str(row.get("segment_value")))
+            rec = out.get(key, {})
+            for col in ("oe", "obs_rate", "mean_pd"):
+                if col in row.index and not _finite(rec.get(col)):
+                    rec[col] = row.get(col)
+            out[key] = rec
+    return out
 
 
 def _heading(anchor, title):
@@ -223,10 +294,11 @@ def _artifact_sql_map(result):
     return out
 
 
-def _grouped_next_actions(recs):
-    # type: (pd.DataFrame) -> str
+def _grouped_next_actions(recs, result=None):
+    # type: (pd.DataFrame, Optional[SegmentEvalResult]) -> str
     if recs is None or recs.empty:
         return '<p class="note">No recommendations: every segment passed on the pooled score.</p>'
+    calib = _calib_lookup(result)
     blocks = []
     grouped = recs.copy()
     grouped["_seg"] = grouped["segment_col"].astype(str)
@@ -256,10 +328,13 @@ def _grouped_next_actions(recs):
             headline = "%s — %s: %s" % (action, seg_col, ", ".join(unique_vals))
             why = str(part.iloc[0]["why"])
         evidence = " | ".join(str(e) for e in part["evidence"].tolist() if e)
+        extra = ""
+        if action == "RECALIBRATE":
+            extra = _recalibrate_calib_table(str(seg_col), unique_vals, calib)
         blocks.append(
             '<div class="rec p%d"><div class="h">%d. %s &nbsp;%s</div>'
             '<div class="w">%s</div>'
-            '<div class="e"><span class="values">%s = %s</span> &middot; %s</div></div>'
+            '<div class="e"><span class="values">%s = %s</span> &middot; %s</div>%s</div>'
             % (
                 int(priority),
                 rank,
@@ -269,10 +344,38 @@ def _grouped_next_actions(recs):
                 html_safe(seg_col),
                 html_safe(", ".join(unique_vals)),
                 html_safe(evidence),
+                extra,
             )
         )
         rank += 1
     return "".join(blocks)
+
+
+def _recalibrate_calib_table(seg_col, values, calib):
+    # type: (str, Sequence[str], Dict[Tuple[str, str], Dict[str, Any]]) -> str
+    rows = []
+    for value in values:
+        rec = calib.get((seg_col, value), {})
+        rows.append(
+            {
+                "segment_col": seg_col,
+                "segment_value": value,
+                "oe": rec.get("oe"),
+                "observed": _pct(rec.get("obs_rate")),
+                "expected": _pct(rec.get("mean_pd")),
+            }
+        )
+    table = pd.DataFrame(rows)
+    if table.empty:
+        return ""
+    return (
+        '<div class="calib">O/E is observed event rate / expected mean PD.</div>'
+        + frozen_html_table(
+            table,
+            ["segment_col", "segment_value", "oe", "observed", "expected"],
+            empty_message="",
+        )
+    )
 
 
 def _verdict_table(result, sql_map):
@@ -374,28 +477,97 @@ def _verdict_table(result, sql_map):
 def _matched_ar_illustration():
     # type: () -> str
     svg = """
-<svg viewBox="0 0 720 210" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Matched approval-rate cutoff simulation">
+<svg id="ar-illustration" viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Matched approval-rate cutoff simulation">
   <text x="12" y="18" font-size="13" font-weight="600" fill="#1f2328">How the matched-AR cutoff is simulated</text>
-  <text x="12" y="40" font-size="11" fill="#57606a">1. Score (PD) on the x-axis. Approve when score &le; cutoff.</text>
-  <rect x="20" y="55" width="200" height="70" fill="#ddf4ff" stroke="#0969da"/>
-  <text x="30" y="75" font-size="11">Portfolio scores</text>
-  <line x1="160" y1="55" x2="160" y2="125" stroke="#b42318" stroke-width="2"/>
-  <text x="128" y="140" font-size="10" fill="#b42318">portfolio cutoff</text>
-  <text x="30" y="148" font-size="10">AR_ref (e.g. 85%)</text>
-  <rect x="260" y="55" width="200" height="70" fill="#fff8c5" stroke="#9a6700"/>
-  <text x="270" y="75" font-size="11">Segment scores (shifted)</text>
-  <line x1="400" y1="55" x2="400" y2="125" stroke="#b42318" stroke-width="2"/>
-  <text x="270" y="148" font-size="10">AR_seg at the same cutoff (e.g. 55%)</text>
-  <text x="480" y="70" font-size="11">2. If |AR_seg - AR_ref| &ge; 10%</text>
-  <text x="480" y="88" font-size="11">anchor = min(AR_seg, AR_ref).</text>
-  <text x="480" y="106" font-size="11">3. Re-derive a threshold inside</text>
-  <text x="480" y="122" font-size="11">each group that hits that AR,</text>
-  <text x="480" y="138" font-size="11">keep approved rows, recompute Gini.</text>
-  <line x1="20" y1="175" x2="700" y2="175" stroke="#d8dee4"/>
-  <text x="12" y="198" font-size="11" fill="#57606a">Only rows with |approval-rate gap| of at least 10% are shown below.</text>
+  <text x="12" y="38" font-size="11" fill="#57606a">1. Score (PD) on the x-axis. Approve when score &le; cutoff. Click a row to load that segment's numbers.</text>
+  <rect x="20" y="55" width="220" height="80" fill="#ddf4ff" stroke="#0969da"/>
+  <text x="30" y="74" font-size="11">Portfolio scores</text>
+  <line id="ar-cut-port" x1="180" y1="55" x2="180" y2="135" stroke="#b42318" stroke-width="2"/>
+  <text id="ar-label-port-cut" x="24" y="148" font-size="10" fill="#b42318">portfolio cutoff = (click a row)</text>
+  <text id="ar-label-ar-ref" x="30" y="164" font-size="10">AR_ref</text>
+  <rect x="260" y="55" width="220" height="80" fill="#fff8c5" stroke="#9a6700"/>
+  <text x="270" y="74" font-size="11">Segment scores</text>
+  <line id="ar-cut-seg" x1="420" y1="55" x2="420" y2="135" stroke="#b42318" stroke-width="2"/>
+  <text id="ar-label-seg-same" x="264" y="148" font-size="10" fill="#b42318">same cutoff</text>
+  <text id="ar-label-ar-seg" x="270" y="164" font-size="10">AR_seg at that cutoff</text>
+  <line id="ar-cut-matched-port" x1="180" y1="55" x2="180" y2="135" stroke="#1a7f37" stroke-width="2" stroke-dasharray="5 3" opacity="0"/>
+  <line id="ar-cut-matched-seg" x1="420" y1="55" x2="420" y2="135" stroke="#1a7f37" stroke-width="2" stroke-dasharray="5 3" opacity="0"/>
+  <text x="500" y="70" font-size="11">2. If |AR_seg - AR_ref| &ge; 10%</text>
+  <text x="500" y="88" font-size="11">anchor = min(AR_seg, AR_ref).</text>
+  <text x="500" y="106" font-size="11">3. Re-derive a threshold inside</text>
+  <text x="500" y="122" font-size="11">each group that hits that AR.</text>
+  <text id="ar-label-matched" x="500" y="148" font-size="11" fill="#1a7f37">matched cutoffs appear as dashed lines</text>
+  <text id="ar-label-row" x="12" y="198" font-size="11" fill="#57606a">No row selected yet. Click a 10% gap row below.</text>
+  <text x="12" y="230" font-size="10" fill="#57606a">Solid red = portfolio cutoff applied to both sides. Dashed green = matched-AR cutoffs (one per group).</text>
 </svg>
 """
-    return '<div class="illus">' + svg + "</div>"
+    script = """
+<script>
+(function () {
+  var BOX_PORT = 20, BOX_SEG = 260, BOX_W = 220;
+  function clamp01(v) {
+    if (v === null || v === undefined || isNaN(v)) return 0.5;
+    return Math.max(0, Math.min(1, v));
+  }
+  function xAt(left, cutoff) { return left + clamp01(cutoff) * BOX_W; }
+  function fmt(v, digits) {
+    if (v === null || v === undefined || isNaN(v)) return "-";
+    var n = Number(v);
+    if (digits === "%") return (100 * n).toFixed(1) + "%";
+    return n.toFixed(digits || 3);
+  }
+  function setLine(id, left, cutoff, show) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    var x = xAt(left, cutoff);
+    el.setAttribute("x1", x);
+    el.setAttribute("x2", x);
+    el.setAttribute("opacity", show ? "1" : "0");
+  }
+  function setText(id, text) {
+    var el = document.getElementById(id);
+    if (el) el.textContent = text;
+  }
+  function applyRow(tr) {
+    var rows = document.querySelectorAll("#ar-table tr.clickable");
+    for (var i = 0; i < rows.length; i++) rows[i].className = rows[i].className.replace(" selected", "");
+    tr.className = tr.className + " selected";
+    var cut = parseFloat(tr.getAttribute("data-cutoff"));
+    var cutSeg = parseFloat(tr.getAttribute("data-cutoff-seg"));
+    var cutRef = parseFloat(tr.getAttribute("data-cutoff-ref-matched"));
+    var arSeg = parseFloat(tr.getAttribute("data-ar-seg"));
+    var arRef = parseFloat(tr.getAttribute("data-ar-ref"));
+    var matched = parseFloat(tr.getAttribute("data-matched-ar"));
+    var label = tr.getAttribute("data-label") || "";
+    setLine("ar-cut-port", BOX_PORT, cut, true);
+    setLine("ar-cut-seg", BOX_SEG, cut, true);
+    setLine("ar-cut-matched-port", BOX_PORT, cutRef, !isNaN(cutRef));
+    setLine("ar-cut-matched-seg", BOX_SEG, cutSeg, !isNaN(cutSeg));
+    setText("ar-label-port-cut", "portfolio cutoff = " + fmt(cut, 4));
+    setText("ar-label-seg-same", "same cutoff = " + fmt(cut, 4));
+    setText("ar-label-ar-ref", "AR_ref = " + fmt(arRef, "%"));
+    setText("ar-label-ar-seg", "AR_seg at that cutoff = " + fmt(arSeg, "%"));
+    setText(
+      "ar-label-matched",
+      "matched AR " + fmt(matched, "%") +
+      "  |  cutoff_seg " + fmt(cutSeg, 4) +
+      "  |  cutoff_ref " + fmt(cutRef, 4)
+    );
+    setText("ar-label-row", "Showing cutoffs for " + label);
+  }
+  function bind() {
+    var rows = document.querySelectorAll("#ar-table tr.clickable");
+    for (var i = 0; i < rows.length; i++) {
+      rows[i].addEventListener("click", function (ev) { applyRow(ev.currentTarget); });
+    }
+    if (rows.length) applyRow(rows[0]);
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", bind);
+  else bind();
+})();
+</script>
+"""
+    return '<div class="illus">' + svg + "</div>" + script
 
 
 def _matched_ar_section(result, gates):
@@ -403,7 +575,8 @@ def _matched_ar_section(result, gates):
     intro = (
         '<p class="note">A segment scored on a different part of the risk spectrum cannot be '
         "compared to the portfolio at face value. When the approval-rate gap reaches 10%, "
-        "both sides are re-cut to the lower-AR anchor and Gini is recomputed there.</p>"
+        "both sides are re-cut to the lower-AR anchor and Gini is recomputed there. "
+        "Click a row to move the cutoff lines to that segment's numbers.</p>"
     )
     decisions = result.decisions
     if decisions is None or decisions.empty or "ar_gap" not in decisions.columns:
@@ -413,26 +586,76 @@ def _matched_ar_section(result, gates):
     cols = [
         "segment_col",
         "segment_value",
+        "ar_reference_cutoff",
         "ar_segment",
         "ar_reference",
         "ar_gap",
         "matched_ar",
         "matched_ar_anchor",
+        "matched_ar_threshold_segment",
+        "matched_ar_threshold_reference",
         "gini",
         "gini_at_matched_ar",
         "gini_reference_at_matched_ar",
         "gini_at_matched_ar_gap",
         "ar_artifact_suspected",
     ]
-    return (
-        intro
-        + _matched_ar_illustration()
-        + frozen_html_table(
-            triggered,
-            cols,
-            empty_message="No segment has an approval-rate gap of 10% or more.",
+    if triggered.empty:
+        return (
+            intro
+            + _matched_ar_illustration()
+            + '<p class="note">No segment has an approval-rate gap of 10% or more.</p>'
         )
+    freeze = [c for c in _INDEX_COLS if c in triggered.columns]
+    show = [c for c in cols if c in triggered.columns]
+    numeric = dict((c, _is_numeric_column(triggered[c])) for c in show)
+    head = []
+    for col in show:
+        klass = []
+        if freeze and col == freeze[0]:
+            klass.append("idx")
+        elif len(freeze) > 1 and col == freeze[1]:
+            klass.append("idx2")
+        if numeric.get(col):
+            klass.append("num")
+        attr = ' class="%s"' % (" ".join(klass),) if klass else ""
+        head.append("<th%s>%s</th>" % (attr, html_safe(col)))
+    body = []
+    for _idx, row in triggered.iterrows():
+        label = "%s = %s" % (row.get("segment_col"), row.get("segment_value"))
+        attrs = (
+            ' class="clickable" data-label="%s" data-cutoff="%s" data-cutoff-seg="%s" '
+            'data-cutoff-ref-matched="%s" data-ar-seg="%s" data-ar-ref="%s" data-matched-ar="%s"'
+            % (
+                html_safe(label),
+                _js_num(row.get("ar_reference_cutoff")),
+                _js_num(row.get("matched_ar_threshold_segment")),
+                _js_num(row.get("matched_ar_threshold_reference")),
+                _js_num(row.get("ar_segment")),
+                _js_num(row.get("ar_reference")),
+                _js_num(row.get("matched_ar")),
+            )
+        )
+        cells = []
+        for col in show:
+            klass = []
+            if freeze and col == freeze[0]:
+                klass.append("idx")
+            elif len(freeze) > 1 and col == freeze[1]:
+                klass.append("idx2")
+            if numeric.get(col):
+                klass.append("num")
+            attr = ' class="%s"' % (" ".join(klass),) if klass else ""
+            cells.append("<td%s>%s</td>" % (attr, _cell(row[col], col)))
+        body.append("<tr%s>%s</tr>" % (attrs, "".join(cells)))
+    table = (
+        '<div class="scroll"><table id="ar-table" class="frozen"><thead><tr>'
+        + "".join(head)
+        + "</tr></thead><tbody>"
+        + "".join(body)
+        + "</tbody></table></div>"
     )
+    return intro + _matched_ar_illustration() + table
 
 
 def _psi_link(row):
@@ -586,12 +809,15 @@ def _grouping_section(result):
     if keep.empty:
         return intro + '<p class="note">Every compared bin is aligned; nothing significant to show.</p>'
     display = keep.copy()
+    if "portfolio_bins" in display.columns and "portfolio_bin" not in display.columns:
+        display["portfolio_bin"] = display["portfolio_bins"]
     display["comparison"] = [_grouping_link(row) for _i, row in display.iterrows()]
     cols = [
         "segment_col",
         "segment_value",
         "feature",
         "segment_bin",
+        "portfolio_bin",
         "kind",
         "significant",
         "woe_segment",
@@ -652,15 +878,106 @@ def _grouping_section(result):
     return intro + table + "".join(figures)
 
 
-def _stability_section(result):
-    # type: (SegmentEvalResult) -> str
+def _stability_flag_viz(row, gates):
+    # type: (pd.Series, Gates) -> str
+    raw = str(row.get("stability_flags") or "")
+    flags = [f for f in raw.split(",") if f]
+    if not flags:
+        meaning = "No stability flags: the predictor cleared every vintage gate."
+        return '<div class="flag-viz"><span class="note">stable</span><div class="flag-mean">%s</div></div>' % (
+            html_safe(meaning),
+        )
+    meaning = " ".join(_STABILITY_FLAG_MEANING.get(f, f) for f in flags)
+    meters = [
+        ("PSI", row.get("psi_max"), gates.stability_psi_max, True, "distribution_drift" in flags),
+        (
+            "weak vint.",
+            row.get("weak_vintage_share"),
+            gates.stability_max_weak_vintage_share,
+            True,
+            "power_loss_in_vintage" in flags,
+        ),
+        (
+            "Gini ratio",
+            row.get("gini_ratio_median"),
+            gates.stability_gini_ratio_min,
+            False,
+            "power_loss_median" in flags,
+        ),
+        (
+            "sign",
+            row.get("sign_consistency"),
+            gates.stability_sign_consistency_min,
+            False,
+            "sign_flip" in flags,
+        ),
+        (
+            "score",
+            row.get("stability_score"),
+            gates.stability_score_min,
+            False,
+            "low_stability_score" in flags,
+        ),
+    ]
+    height = 16 * len(meters) + 8
+    parts = [
+        '<svg width="240" height="%d" viewBox="0 0 240 %d" xmlns="http://www.w3.org/2000/svg">'
+        % (height, height)
+    ]
+    for i, item in enumerate(meters):
+        label, value, gate, higher_worse, fired = item
+        y = 4 + i * 16
+        color = "#b42318" if fired else "#57606a"
+        bar_color = "#b42318" if fired else "#0969da"
+        val = float(value) if _finite(value) else 0.0
+        gate_f = float(gate) if _finite(gate) else 0.0
+        scale = max(val, gate_f, 1e-6)
+        if not higher_worse:
+            scale = max(scale, 1.0)
+        bar_w = 90.0 * min(val / scale, 1.0)
+        gate_x = 70.0 + 90.0 * min(gate_f / scale, 1.0)
+        parts.append(
+            '<text x="0" y="%d" font-size="9" fill="%s">%s</text>'
+            % (y + 10, color, html_safe(label))
+        )
+        parts.append(
+            '<rect x="70" y="%d" width="90" height="8" fill="#eef1f4" rx="1"/>' % (y + 3,)
+        )
+        parts.append(
+            '<rect x="70" y="%d" width="%.1f" height="8" fill="%s" rx="1"/>'
+            % (y + 3, bar_w, bar_color)
+        )
+        parts.append(
+            '<line x1="%.1f" y1="%d" x2="%.1f" y2="%d" stroke="#1f2328" stroke-width="1"/>'
+            % (gate_x, y + 2, gate_x, y + 12)
+        )
+        shown = "-" if not _finite(value) else ("%.2f" % float(value))
+        parts.append(
+            '<text x="166" y="%d" font-size="9" fill="%s">%s</text>'
+            % (y + 10, color, html_safe(shown))
+        )
+    parts.append("</svg>")
+    flag_list = ", ".join(flags)
+    return (
+        '<div class="flag-viz">%s<div class="flag-mean"><strong>%s</strong> — %s</div></div>'
+        % ("".join(parts), html_safe(flag_list), html_safe(meaning))
+    )
+
+
+def _stability_section(result, gates=None):
+    # type: (SegmentEvalResult, Optional[Gates]) -> str
+    gates = gates or _gates_from_result(result)
     stability = result.stability if result.stability is not None else pd.DataFrame()
     intro = (
         '<p class="note">Logit / VAL / LIN predictors are assessed on portfolio-quantile bins '
         "(segment vs overall), with <code>__missing__</code> kept as its own category. Ordinary "
-        "WoE predictors still use the grouping bins. <code>stability_binning</code> records "
-        "which ruler was used.</p>"
+        "WoE predictors still use the grouping bins. The flag column draws each metric against "
+        "its gate (black tick); a red bar is a fired flag.</p>"
     )
+    if stability is None or stability.empty:
+        return intro + '<p class="note">No stability diagnostics available.</p>'
+    display = stability.copy()
+    display["flag_meaning"] = [_stability_flag_viz(row, gates) for _i, row in display.iterrows()]
     cols = [
         "segment_col",
         "segment_value",
@@ -674,9 +991,40 @@ def _stability_section(result):
         "stable",
         "stability_flags",
         "stability_binning",
+        "flag_meaning",
     ]
-    return intro + frozen_html_table(
-        stability, cols, empty_message="No stability diagnostics available."
+    freeze = [c for c in _INDEX_COLS if c in display.columns]
+    show = [c for c in cols if c in display.columns]
+    head = []
+    for col in show:
+        klass = []
+        if freeze and col == freeze[0]:
+            klass.append("idx")
+        elif len(freeze) > 1 and col == freeze[1]:
+            klass.append("idx2")
+        attr = ' class="%s"' % (" ".join(klass),) if klass else ""
+        head.append("<th%s>%s</th>" % (attr, html_safe(col)))
+    body = []
+    for _idx, row in display.iterrows():
+        cells = []
+        for col in show:
+            klass = []
+            if freeze and col == freeze[0]:
+                klass.append("idx")
+            elif len(freeze) > 1 and col == freeze[1]:
+                klass.append("idx2")
+            attr = ' class="%s"' % (" ".join(klass),) if klass else ""
+            if col == "flag_meaning":
+                cells.append("<td%s>%s</td>" % (attr, row[col]))
+            else:
+                cells.append("<td%s>%s</td>" % (attr, _cell(row[col], col)))
+        body.append("<tr>" + "".join(cells) + "</tr>")
+    return intro + (
+        '<div class="scroll"><table class="frozen"><thead><tr>'
+        + "".join(head)
+        + "</tr></thead><tbody>"
+        + "".join(body)
+        + "</tbody></table></div>"
     )
 
 
@@ -711,13 +1059,16 @@ def _plot_vintage_col(part, segment_col, portfolio_rates):
             hues.append(value)
     x = np.arange(len(vintages))
     width = 0.8 / max(len(hues), 1)
-    fig, ax = plt.subplots(figsize=(max(8.0, 0.42 * len(vintages) + 3.5), 4.4))
-    ax2 = ax.twinx()
+    fig, (ax_rate, ax_gini) = plt.subplots(
+        2, 1, sharex=True, figsize=(max(8.0, 0.42 * len(vintages) + 3.5), 7.2)
+    )
+    ax_rate_r = ax_rate.twinx()
+    ax_gini_r = ax_gini.twinx()
     cmap = plt.get_cmap("tab10")
     for i, sval in enumerate(hues):
         sub = part.loc[part["segment_value"].astype(str).eq(sval)]
         by_v = dict((str(r["vintage"]), r) for _, r in sub.iterrows())
-        ns, rates, ginis, oes = [], [], [], []
+        ns, rates, ginis = [], [], []
         for v in vintages:
             row = by_v.get(v)
             n = float(row["n"]) if row is not None else 0.0
@@ -725,16 +1076,15 @@ def _plot_vintage_col(part, segment_col, portfolio_rates):
             ns.append(n)
             rates.append(defaults / n if n else float("nan"))
             ginis.append(float(row["gini"]) if row is not None else float("nan"))
-            oes.append(float(row["oe"]) if row is not None else float("nan"))
         color = cmap(i % 10)
         offset = (i - (len(hues) - 1) / 2.0) * width
-        ax.bar(x + offset, ns, width=width * 0.9, color=color, alpha=0.35, label="%s n" % sval)
-        ax2.plot(x, rates, marker="o", color=color, label="%s default" % sval)
-        ax2.plot(x, ginis, marker="s", linestyle="--", color=color, label="%s gini" % sval)
-        ax2.plot(x, oes, marker="^", linestyle=":", color=color, label="%s oe" % sval)
+        ax_rate.bar(x + offset, ns, width=width * 0.9, color=color, alpha=0.28, label="%s n" % sval)
+        ax_gini.bar(x + offset, ns, width=width * 0.9, color=color, alpha=0.28, label="%s n" % sval)
+        ax_rate_r.plot(x, rates, marker="o", color=color, label="%s event rate" % sval)
+        ax_gini_r.plot(x, ginis, marker="s", linestyle="--", color=color, label="%s gini" % sval)
     if portfolio_rates:
         pr = [portfolio_rates.get(v, float("nan")) for v in vintages]
-        ax2.plot(
+        ax_rate_r.plot(
             x,
             pr,
             color="black",
@@ -742,14 +1092,18 @@ def _plot_vintage_col(part, segment_col, portfolio_rates):
             linestyle=(0, (5, 2, 1, 2)),
             label="portfolio event rate",
         )
-    ax.set_xticks(x)
-    ax.set_xticklabels(vintages, rotation=45, ha="right")
-    ax.set_ylabel("n")
-    ax2.set_ylabel("default / gini / O/E")
-    ax.set_title("%s — vintage n, default, Gini, O/E" % segment_col)
-    handles, labels = ax.get_legend_handles_labels()
-    h2, lab2 = ax2.get_legend_handles_labels()
-    ax.legend(handles + h2, labels + lab2, fontsize="small", ncol=2, loc="upper left")
+    ax_rate.set_ylabel("n")
+    ax_rate_r.set_ylabel("event rate")
+    ax_gini.set_ylabel("n")
+    ax_gini_r.set_ylabel("Gini")
+    ax_rate.set_title("%s — volume and event rate" % segment_col)
+    ax_gini.set_title("%s — volume and Gini" % segment_col)
+    ax_gini.set_xticks(x)
+    ax_gini.set_xticklabels(vintages, rotation=45, ha="right")
+    for ax, ax_r in ((ax_rate, ax_rate_r), (ax_gini, ax_gini_r)):
+        handles, labels = ax.get_legend_handles_labels()
+        h2, lab2 = ax_r.get_legend_handles_labels()
+        ax.legend(handles + h2, labels + lab2, fontsize="small", ncol=2, loc="upper left")
     fig.tight_layout()
     return _fig_img(fig, "vintage %s" % segment_col)
 
@@ -759,8 +1113,8 @@ def _vintage_section(result):
     vintage = result.vintage if result.vintage is not None else pd.DataFrame()
     intro = (
         '<p class="note">One chart per <code>segment_col</code>, hue = <code>segment_value</code>. '
-        "Bars are volume (<code>n</code>); lines are default rate, Gini and O/E. The black "
-        "striped line is the portfolio event rate over the same vintages.</p>"
+        "Each panel keeps the volume bars. The top panel is event rate (the black striped "
+        "line is the portfolio event rate); the bottom panel is Gini.</p>"
     )
     if vintage.empty:
         return intro + '<p class="note">No vintage table available.</p>'
@@ -809,7 +1163,7 @@ def render_condensed_html_report(result, title="Segment scorecard evaluation (co
         '<p class="note">RECALIBRATE (and other triggered actions) are grouped by '
         "<code>segment_col</code>, listing every triggered <code>segment_value</code>.</p>"
     )
-    parts.append(_grouped_next_actions(recs))
+    parts.append(_grouped_next_actions(recs, result))
 
     parts.append(_heading("sec-verdicts", "2. Per-segment verdicts"))
     parts.append(_verdict_table(result, sql_map))
@@ -824,10 +1178,13 @@ def render_condensed_html_report(result, title="Segment scorecard evaluation (co
     parts.append(_grouping_section(result))
 
     parts.append(_heading("sec-stability", "6. Predictor stability over vintages"))
-    parts.append(_stability_section(result))
+    parts.append(_stability_section(result, gates))
 
     parts.append(_heading("sec-vintage", "7. Vintage detail"))
     parts.append(_vintage_section(result))
+
+    parts.append(_heading("sec-gates", "8. Gates used"))
+    parts.append('<div class="card">' + _gates_block(gates) + "</div>")
 
     parts.append("</div></body></html>")
     return "".join(parts)
