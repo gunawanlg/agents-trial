@@ -1067,8 +1067,10 @@ class BinningModel(object):
         """One row of three subplots of WoE grouping stability over vintages.
 
         Left: true event rate by bin.  Middle: bin share.  Right: univariate
-        Gini of the transformed predictor.  The ``__missing__`` bin stays in
-        the legend even when every vintage has ``n=0`` for it.  Requires the
+        Gini of the transformed predictor.  The feature name is the figure
+        title.  The legend sits outside the axes and always includes
+        ``__missing__``, even when every vintage has ``n=0`` for it (matplotlib
+        otherwise drops artists whose label starts with ``_``).  Requires the
         optional ``plot`` extra (``matplotlib``).
         """
         try:
@@ -1111,7 +1113,7 @@ class BinningModel(object):
             bins.append(MISSING_LABEL)
         x_vals, use_dates = _vintage_axis_values(vintages)
         fig, axes = plt.subplots(
-            1, 3, sharex=True, figsize=figsize or (14.0, 4.0)
+            1, 3, sharex=True, figsize=figsize or (15.5, 4.2)
         )
         axes = np.atleast_1d(axes).ravel()
         legend_handles = []
@@ -1134,20 +1136,25 @@ class BinningModel(object):
                     shares.append(0.0)
                 else:
                     shares.append(float("nan"))
-            line = axes[0].plot(x_vals, rates, marker="o", label=bin_label)[0]
-            axes[1].plot(x_vals, shares, marker="o", label=bin_label)
-            handle = line
-            y_arr = np.asarray(rates, dtype=float)
-            if not np.any(np.isfinite(y_arr)):
-                handle = Line2D(
-                    [0],
-                    [0],
-                    color=line.get_color(),
-                    marker="o",
-                    linestyle=line.get_linestyle(),
-                )
+            # Do not set label= on the axes artists: matplotlib treats a label
+            # that starts with "_" (including __missing__) as private and
+            # drops it from any legend built from the plotted lines.
+            line = axes[0].plot(x_vals, rates, marker="o")[0]
+            axes[1].plot(x_vals, shares, marker="o", color=line.get_color())
+            handle = Line2D(
+                [0],
+                [0],
+                color=line.get_color(),
+                marker="o",
+                linestyle="-",
+                linewidth=1.5,
+            )
             legend_handles.append(handle)
             legend_labels.append(bin_label)
+        if MISSING_LABEL not in [str(lab) for lab in legend_labels]:
+            handle = Line2D([0], [0], marker="o", linestyle="-", linewidth=1.5)
+            legend_handles.append(handle)
+            legend_labels.append(MISSING_LABEL)
         gini_by_v = table.drop_duplicates("vintage")
         gini_lookup = dict(
             (str(row["vintage"]), float(row["univariate_gini"]))
@@ -1160,7 +1167,7 @@ class BinningModel(object):
         axes[0].set_ylabel("event rate")
         axes[1].set_ylabel("share")
         axes[2].set_ylabel("univariate Gini")
-        axes[0].set_title("%s — true event rate" % feature)
+        axes[0].set_title("true event rate")
         axes[1].set_title("bin share")
         axes[2].set_title("univariate Gini")
         axes[1].set_ylim(0.0, 1.0)
@@ -1179,14 +1186,18 @@ class BinningModel(object):
         else:
             axes[2].set_xticks(x_vals)
             axes[2].set_xticklabels(vintages, rotation=45, ha="right")
-        if MISSING_LABEL not in [str(lab) for lab in legend_labels]:
-            legend_handles.append(Line2D([0], [0], marker="o"))
-            legend_labels.append(MISSING_LABEL)
-        if len(legend_labels) <= 12:
-            axes[0].legend(
-                legend_handles, legend_labels, loc="best", fontsize="small", ncol=2
-            )
-        fig.tight_layout()
+        fig.suptitle(str(feature))
+        fig.tight_layout(rect=[0.0, 0.0, 0.82, 0.90])
+        fig.legend(
+            legend_handles,
+            legend_labels,
+            loc="center left",
+            bbox_to_anchor=(0.83, 0.5),
+            bbox_transform=fig.transFigure,
+            fontsize="small",
+            frameon=False,
+            borderaxespad=0.0,
+        )
         return fig, axes
 
     def clone(self):

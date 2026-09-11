@@ -238,8 +238,12 @@ def test_plot_vintage_stability_three_subplots():
     assert axes[0].get_ylabel() == "event rate"
     assert axes[1].get_ylabel() == "share"
     assert axes[2].get_ylabel() == "univariate Gini"
-    legend = axes[0].get_legend()
-    assert legend is not None
+    assert axes[0].get_title() == "true event rate"
+    assert fig._suptitle is not None
+    assert fig._suptitle.get_text() == "x"
+    assert axes[0].get_legend() is None
+    assert fig.legends
+    legend = fig.legends[0]
     legend_texts = [t.get_text() for t in legend.get_texts()]
     assert MISSING_LABEL in legend_texts
     line = axes[0].get_lines()[0]
@@ -250,6 +254,24 @@ def test_plot_vintage_stability_three_subplots():
         formatter,
         (mdates.ConciseDateFormatter, mdates.DateFormatter, mdates.AutoDateFormatter),
     )
+
+
+def test_plot_vintage_stability_legend_keeps_missing_when_absent_from_data():
+    """``__missing__`` is in the outside legend even with no nulls in the frame."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+
+    frame = _dated_book(n=1800, seed=9)
+    assert frame["x"].notna().all()
+    model = BinningModel.fit(frame[["x"]], frame["y"], Gates())
+    fig, axes = model.plot_vintage_stability(
+        frame, frame["y"], "date", "x", min_rows=40
+    )
+    assert axes[0].get_legend() is None
+    texts = [t.get_text() for t in fig.legends[0].get_texts()]
+    assert MISSING_LABEL in texts
+    bbox = fig.legends[0].get_bbox_to_anchor()
+    assert bbox.x0 >= 0.8
 
 
 def test_overlapping_event_rate_bounds_are_merged():
