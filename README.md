@@ -222,8 +222,10 @@ characteristics table records which path each feature took.
 `grouping.vintage_stability_table(...)` is the long frame of per-bin true
 event rate, share and univariate Gini over vintages.
 `grouping.plot_vintage_stability(...)` draws those as one row of three subplots
-(requires `matplotlib`), with a date-formatted x-axis and `__missing__` kept
-in the legend even when a vintage has no missings. Adjacent bins whose vintage event-rate Wilson
+(requires `matplotlib`), with the feature as the figure title, a date-formatted
+x-axis, and a colour legend outside the axes that always includes `__missing__`
+(even when a vintage has no missings — matplotlib drops in-axis labels that
+start with `_`). Adjacent bins whose vintage event-rate Wilson
 intervals overlap are merged (`merge_overlapping_event_rate_bounds`);
 remaining overlaps are flagged as `overlapping_event_rate_bounds` on the
 stability table.
