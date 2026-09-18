@@ -119,6 +119,7 @@ def test_html_report_is_self_contained_and_has_every_section(result):
     for heading in (
         "What to do next",
         "Per-segment verdicts",
+        "Portfolio WoE grouping",
         "matched approval rate",
         "Characteristic drift and PSI method",
         "Refit performance",
@@ -169,6 +170,7 @@ def test_markdown_report_covers_the_same_ground(result):
     for heading in (
         "## 1. What to do next",
         "## 2. Per-segment verdicts",
+        "## 2b. Portfolio WoE grouping",
         "## 3. Matched approval-rate comparison",
         "## 4. Characteristic drift (PSI)",
         "## 5. Refit performance",

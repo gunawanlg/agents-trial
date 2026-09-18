@@ -110,3 +110,98 @@ def test_q2_keep_when_lift_too_small():
     )
     assert action == "KEEP_POOLED"
     assert reason == "need_new_information_not_new_coefficients"
+
+
+def test_q2_portfolio_keep_when_good():
+    from scorecard_segment_eval.decision import q2_portfolio_action
+
+    action, reason = q2_portfolio_action(
+        q1="GOOD",
+        failed_pillars=[],
+        delta_gini=None,
+        delta_gini_ci_low=None,
+        brier_refit=None,
+        brier_pooled=None,
+        logloss_refit=None,
+        logloss_pooled=None,
+        gates=Gates(),
+        whatif=False,
+    )
+    assert action == "KEEP_POOLED"
+    assert reason == "performance_good"
+
+
+def test_q2_portfolio_recalibrate_when_cal_only():
+    from scorecard_segment_eval.decision import q2_portfolio_action
+
+    action, reason = q2_portfolio_action(
+        q1="WEAK",
+        failed_pillars=["calibration"],
+        delta_gini=None,
+        delta_gini_ci_low=None,
+        brier_refit=None,
+        brier_pooled=None,
+        logloss_refit=None,
+        logloss_pooled=None,
+        gates=Gates(),
+        whatif=False,
+    )
+    assert action == "RECALIBRATE"
+
+
+def test_q2_portfolio_whatif_refit_when_holdout_wins():
+    from scorecard_segment_eval.decision import q2_portfolio_action
+
+    action, reason = q2_portfolio_action(
+        q1="GOOD",
+        failed_pillars=[],
+        delta_gini=0.08,
+        delta_gini_ci_low=0.04,
+        brier_refit=0.10,
+        brier_pooled=0.12,
+        logloss_refit=0.40,
+        logloss_pooled=0.45,
+        gates=Gates(min_delta_gini=0.03),
+        whatif=True,
+    )
+    assert action == "REFIT"
+    assert reason == "holdout_delta_gini_portfolio"
+
+
+def test_q2_portfolio_whatif_monitor_when_unstable():
+    from scorecard_segment_eval.decision import q2_portfolio_action
+
+    action, reason = q2_portfolio_action(
+        q1="WEAK",
+        failed_pillars=["rank_order"],
+        delta_gini=0.08,
+        delta_gini_ci_low=0.04,
+        brier_refit=0.10,
+        brier_pooled=0.12,
+        logloss_refit=0.40,
+        logloss_pooled=0.45,
+        gates=Gates(min_delta_gini=0.03),
+        stability_pass_flag=False,
+        stability_reason="sign_flip",
+        whatif=True,
+    )
+    assert action == "MONITOR"
+    assert reason.startswith("refit_predictors_unstable")
+
+
+def test_q2_portfolio_never_splits():
+    from scorecard_segment_eval.decision import q2_portfolio_action
+
+    action, _reason = q2_portfolio_action(
+        q1="WEAK",
+        failed_pillars=["rank_order"],
+        delta_gini=0.08,
+        delta_gini_ci_low=0.04,
+        brier_refit=0.10,
+        brier_pooled=0.12,
+        logloss_refit=0.40,
+        logloss_pooled=0.45,
+        gates=Gates(min_delta_gini=0.03),
+        whatif=False,
+    )
+    assert action == "KEEP_POOLED"

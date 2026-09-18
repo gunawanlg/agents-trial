@@ -1,13 +1,20 @@
 # scorecard-segment-eval
 
 Sub-population evaluation for logistic scorecards. The package answers two
-questions about a business segment carved out of a scored portfolio:
+questions about a business segment carved out of a scored portfolio, and the
+same two questions of the pooled book itself:
 
-* **Q1 — is the pooled score good enough on this segment?** Discrimination,
-  calibration and shape are each judged against explicit gates.
+* **Q1 — is the pooled score good enough here?** Discrimination (Gini),
+  calibration (O/E, ECE) and vintage stability are each judged against
+  explicit gates.  The book is always scored as the synthetic segment
+  `__overall__` / `ALL`, including the production WoE grouping when one is
+  supplied.
 * **Q2 — is a same-predictor refit worth a dedicated model, or is a
-  recalibration enough?** A refit only earns a split when it beats the pooled
-  score on a forward holdout *and* its predictors are stable over vintages.
+  recalibration enough?** A segment refit only earns a split when it beats the
+  pooled score on a forward holdout *and* its predictors are stable over
+  vintages.  `evaluate_portfolio_whatif` asks the same of the production
+  scorecard: would re-estimating the same predictors on recent data beat the
+  current PD?
 
 Every threshold lives on `Gates`, so a verdict is always traceable to a number
 somebody chose rather than to a hidden constant.
@@ -55,6 +62,35 @@ written = result.save_artifacts("artefacts/")
 Pass `submodel=True` to add an XGBoost sub-model alongside the logistic refit.
 `max_depth` is hard-capped at 3 so the sub-model cannot learn beyond a 3-way
 interaction; other parameters are overridable through `xgb_params`.
+
+The first row of `result.decisions` is always `__overall__` / `ALL`: Gini,
+O/E, ECE, vintage Gini ratio, and (when a grouping is supplied) the production
+WoE table on `result.grouping_summary`.  Per-segment cells follow as before.
+
+### Portfolio what-if refit
+
+`evaluate_portfolio_whatif` skips the per-segment loop and always runs a
+same-predictor holdout refit (and intercept/slope recalibration) on the whole
+book, even when Q1 is `GOOD`.  The Q2 action is `REFIT` when the new
+scorecard beats the production PD on holdout Gini *and* a proper score with
+stable predictors, `MONITOR` when the lift is real but the inputs drift, or
+`RECALIBRATE` / `KEEP_POOLED` otherwise.  `SPLIT` is never returned: there is
+no parent portfolio to split from.
+
+```python
+from scorecard_segment_eval import evaluate_portfolio_whatif
+
+whatif = evaluate_portfolio_whatif(df, cols, Gates(n_jobs=4), grouping=grouping)
+print(whatif.decisions[["q1_verdict", "failed_pillars", "q2_action", "gini", "oe", "ece"]])
+print(whatif.refit_comparison[["gini_pooled", "gini_refit", "delta_gini", "gini_recal"]])
+print(whatif.grouping_summary)
+written = whatif.save_artifacts("artefacts/portfolio_whatif")
+```
+
+`notebooks/portfolio_whatif.ipynb` walks this on the synthetic book: portfolio
+Q1 (Gini, calibration, vintage stability, WoE grouping charts), the holdout
+refit vs the production PD, and the grouping comparison of new bins against
+the original definition.
 
 ### Smart data creation
 
@@ -149,6 +185,10 @@ and the saved refit / recalibration artefacts.
 `notebooks/q2_actions.ipynb` is the shorter walk-through of the three Q2
 actions on the synthetic book: `KEEP_POOLED` (core), `RECALIBRATE` (miscal)
 and `SPLIT` (inverted), including the grouping vintage plot.
+
+`notebooks/portfolio_whatif.ipynb` is the pooled-book counterpart: Q1 on
+`__overall__` / `ALL` (Gini, calibration, vintage / WoE-grouping stability)
+and a what-if same-predictor refit of the production scorecard.
 
 ## Conventions worth knowing
 
@@ -295,7 +335,8 @@ checks run as part of `tests/test_py36_compat.py`.
 
 `decision_table` and `action_list` give the compact tabular verdicts.
 `render_html_report` and `render_markdown_report` build a self-contained
-report — no template engine, no new dependency — with per-segment verdicts, the
+report — no template engine, no new dependency — with per-segment verdicts
+(the first row is the pooled book), the production WoE grouping table, the
 matched-approval-rate Gini comparison, the PSI method per characteristic, the
 segment-vs-portfolio grouping comparison, refit performance and stability
 findings, and a prioritised recommendation list from `recommendations`.

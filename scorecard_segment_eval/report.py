@@ -23,7 +23,11 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-from scorecard_segment_eval.evaluate import SegmentEvalResult
+from scorecard_segment_eval.evaluate import (
+    OVERALL_SEGMENT_COL,
+    SegmentEvalResult,
+    is_overall_segment,
+)
 from scorecard_segment_eval.schema import Gates
 
 DECISION_COLUMNS = (
@@ -51,6 +55,7 @@ DECISION_COLUMNS = (
 #: Action ordering used to prioritise recommendations (lower runs first).
 ACTION_PRIORITY = {
     "SPLIT": 0,
+    "REFIT": 0,
     "RECALIBRATE": 1,
     "MONITOR": 2,
     "KEEP_POOLED": 4,
@@ -59,6 +64,7 @@ ACTION_PRIORITY = {
 
 _ACTION_BADGE = {
     "SPLIT": "danger",
+    "REFIT": "warn",
     "RECALIBRATE": "warn",
     "MONITOR": "warn",
     "KEEP_POOLED": "ok",
@@ -143,13 +149,21 @@ def _recommendation_for_row(row, gates):
     # type: (Dict[str, Any], Gates) -> Optional[Dict[str, Any]]
     action = str(row.get("q2_action") or "NONE")
     verdict = str(row.get("q1_verdict") or "")
-    segment = "%s = %s" % (row.get("segment_col"), row.get("segment_value"))
+    portfolio_row = is_overall_segment(row.get("segment_col"), row.get("segment_value"))
+    if portfolio_row:
+        segment = "the pooled scorecard"
+    else:
+        segment = "%s = %s" % (row.get("segment_col"), row.get("segment_value"))
     volume = row.get("volume_share")
     default_share = row.get("default_share")
     evidence = []  # type: List[str]
-    evidence.append("Gini %s (ratio to portfolio %s)" % (_num(row.get("gini")), _num(row.get("gini_ratio"), 2)))
+    if portfolio_row:
+        evidence.append("Gini %s" % (_num(row.get("gini")),))
+    else:
+        evidence.append("Gini %s (ratio to portfolio %s)" % (_num(row.get("gini")), _num(row.get("gini_ratio"), 2)))
     evidence.append("O/E %s, ECE %s" % (_num(row.get("oe"), 2), _num(row.get("ece"))))
-    evidence.append("volume share %s, default share %s" % (_pct(volume), _pct(default_share)))
+    if not portfolio_row:
+        evidence.append("volume share %s, default share %s" % (_pct(volume), _pct(default_share)))
     if _truthy(row.get("ar_gap_triggered")):
         evidence.append(
             "approval-rate gap %s, Gini at matched AR %s (portfolio %s)"
@@ -165,8 +179,18 @@ def _recommendation_for_row(row, gates):
         evidence.append("predictor stability score %s" % (_num(row.get("stability_score"), 2),))
     if row.get("unstable_predictors"):
         evidence.append("unstable predictors: %s" % (row.get("unstable_predictors"),))
+    if row.get("vintage_gini_ratio") is not None and _num(row.get("vintage_gini_ratio")) != "-":
+        evidence.append("vintage Gini ratio %s" % (_num(row.get("vintage_gini_ratio"), 2),))
 
-    if action == "SPLIT":
+    if action == "REFIT":
+        headline = "Refit the pooled scorecard"
+        why = (
+            "A same-predictor refit on a forward holdout beats the current production PD "
+            "by %s Gini (lower CI bound %s) with a better proper score. Predictor stability "
+            "over vintages also clears the gate, so the new coefficients are expected to hold."
+            % (_num(row.get("delta_gini")), _num(row.get("delta_gini_ci_low")))
+        )
+    elif action == "SPLIT":
         headline = "Split out a dedicated model for %s" % (segment,)
         why = (
             "The pooled score fails rank ordering here, the WoE shape diverges from the "
@@ -181,18 +205,32 @@ def _recommendation_for_row(row, gates):
         why = (
             "Ranking is intact but the PD level is off (O/E %s, ECE %s). A two-parameter "
             "intercept/slope rescale fixes the level without touching the ranking, so no "
-            "split is warranted."
-            % (_num(row.get("oe"), 2), _num(row.get("ece")))
+            "%s is warranted."
+            % (
+                _num(row.get("oe"), 2),
+                _num(row.get("ece")),
+                "refit" if portfolio_row else "split",
+            )
         )
     elif action == "MONITOR":
-        headline = "Hold the split for %s and stabilise its inputs first" % (segment,)
-        why = (
-            "The refit does beat the pooled score on the holdout, but its predictors are "
-            "not stable over vintages (%s). Fitting new coefficients on drifting or "
-            "sign-flipping inputs buys holdout Gini and loses it in production. Fix the "
-            "inputs, or re-assess once more vintages are available."
-            % (row.get("stability_reason") or "see stability table",)
-        )
+        if portfolio_row:
+            headline = "Hold the pooled refit and stabilise its inputs first"
+            why = (
+                "The refit does beat the production PD on the holdout, but its predictors "
+                "are not stable over vintages (%s). Fitting new coefficients on drifting or "
+                "sign-flipping inputs buys holdout Gini and loses it in production. Fix the "
+                "inputs, or re-assess once more vintages are available."
+                % (row.get("stability_reason") or "see stability table",)
+            )
+        else:
+            headline = "Hold the split for %s and stabilise its inputs first" % (segment,)
+            why = (
+                "The refit does beat the pooled score on the holdout, but its predictors are "
+                "not stable over vintages (%s). Fitting new coefficients on drifting or "
+                "sign-flipping inputs buys holdout Gini and loses it in production. Fix the "
+                "inputs, or re-assess once more vintages are available."
+                % (row.get("stability_reason") or "see stability table",)
+            )
     elif action == "NONE" or verdict == "INCONCLUSIVE":
         headline = "Do not judge %s yet -- insufficient power" % (segment,)
         why = (
@@ -214,19 +252,36 @@ def _recommendation_for_row(row, gates):
             )
         )
     elif verdict == "WEAK" and str(row.get("q2_reason")) == "need_new_information_not_new_coefficients":
-        headline = "Source new information for %s rather than refitting" % (segment,)
-        why = (
-            "The segment is weak, but refitting the same predictors does not recover "
-            "enough Gini to justify a split. The bottleneck is the information set, not "
-            "the coefficients: look for predictors that discriminate inside this segment."
-        )
+        if portfolio_row:
+            headline = "Keep the current pooled scorecard -- a same-predictor refit does not recover enough"
+            why = (
+                "The book fails a pillar (%s), but refitting the same predictors does not "
+                "recover enough Gini to replace the production PD. The bottleneck is the "
+                "information set, not the coefficients."
+                % (row.get("failed_pillars") or "-",)
+            )
+        else:
+            headline = "Source new information for %s rather than refitting" % (segment,)
+            why = (
+                "The segment is weak, but refitting the same predictors does not recover "
+                "enough Gini to justify a split. The bottleneck is the information set, not "
+                "the coefficients: look for predictors that discriminate inside this segment."
+            )
     elif verdict == "WEAK":
-        headline = "Keep %s pooled, with monitoring" % (segment,)
-        why = (
-            "The segment fails a pillar (%s) but no remediation clears its gates "
-            "(%s). Keep it pooled and watch it."
-            % (row.get("failed_pillars") or "-", row.get("q2_reason") or "-")
-        )
+        if portfolio_row:
+            headline = "Keep the current pooled scorecard, with monitoring"
+            why = (
+                "The book fails a pillar (%s) but no remediation clears its gates (%s). "
+                "Keep the production PD and watch it."
+                % (row.get("failed_pillars") or "-", row.get("q2_reason") or "-")
+            )
+        else:
+            headline = "Keep %s pooled, with monitoring" % (segment,)
+            why = (
+                "The segment fails a pillar (%s) but no remediation clears its gates "
+                "(%s). Keep it pooled and watch it."
+                % (row.get("failed_pillars") or "-", row.get("q2_reason") or "-")
+            )
     else:
         return None
 
@@ -506,13 +561,24 @@ def _kpis(result):
     # type: (SegmentEvalResult) -> str
     meta = result.meta or {}
     decisions = result.decisions
-    counts = decisions["q2_action"].value_counts() if not decisions.empty else pd.Series(dtype=int)
+    if decisions.empty:
+        counts = pd.Series(dtype=int)
+        n_segments = 0
+        portfolio_q1 = "-"
+    else:
+        counts = decisions["q2_action"].value_counts()
+        mask = ~decisions["segment_col"].astype(str).eq(OVERALL_SEGMENT_COL)
+        n_segments = int(mask.sum())
+        port = decisions.loc[~mask]
+        portfolio_q1 = str(port["q1_verdict"].iloc[0]) if not port.empty else "-"
     items = [
         ("Rows", "{:,}".format(int(meta.get("n_rows", 0)))),
         ("Observable", "{:,}".format(int(meta.get("n_observable", 0)))),
         ("Portfolio Gini", _num(meta.get("overall_gini"))),
-        ("Segments", str(int(len(decisions))) if not decisions.empty else "0"),
+        ("Portfolio Q1", portfolio_q1),
+        ("Segments", str(n_segments)),
         ("Split", str(int(counts.get("SPLIT", 0)))),
+        ("Refit", str(int(counts.get("REFIT", 0)))),
         ("Recalibrate", str(int(counts.get("RECALIBRATE", 0)))),
         ("Monitor", str(int(counts.get("MONITOR", 0)))),
     ]
@@ -661,12 +727,40 @@ def render_html_report(result, title="Segment scorecard evaluation", gates=None,
     parts.append("<h2>2. Per-segment verdicts</h2>")
     parts.append(
         '<p class="note">Q1 asks whether the pooled score is good enough on the segment; Q2 asks '
-        "what to do about it. <strong>SPLIT</strong> requires a material holdout Gini gain with a "
-        "positive lower CI bound, a better proper score, divergent WoE shape <em>and</em> stable "
-        "predictors. <strong>MONITOR</strong> means the performance case was made but stability "
-        "was not.</p>"
+        "what to do about it. The first row is the pooled book (<code>__overall__</code> / "
+        "<code>ALL</code>): Gini, calibration and vintage stability of the production PD, plus "
+        "the WoE grouping when one was supplied. <strong>SPLIT</strong> requires a material "
+        "holdout Gini gain with a positive lower CI bound, a better proper score, divergent WoE "
+        "shape <em>and</em> stable predictors. <strong>REFIT</strong> is the same bar for the "
+        "pooled scorecard (no parent book to split from). <strong>MONITOR</strong> means the "
+        "performance case was made but stability was not.</p>"
     )
     parts.append(_verdict_rows(result))
+
+    parts.append("<h2>2b. Portfolio WoE grouping</h2>")
+    parts.append(
+        '<p class="note">Production WoE / logit grouping on the observable book: bin count, '
+        "information value and univariate Gini of the transformed predictor. Vintage PSI and "
+        "sign consistency of the same grouping live in the predictor-stability table "
+        "(<code>stability_source=production</code>).</p>"
+    )
+    grouping_summary = getattr(result, "grouping_summary", None)
+    parts.append(
+        html_table(
+            grouping_summary,
+            [
+                "feature",
+                "kind",
+                "method",
+                "n_bins",
+                "iv",
+                "univariate_gini",
+                "monotonic",
+                "notes",
+            ],
+            empty_message="No production grouping was supplied, so there is no portfolio WoE table.",
+        )
+    )
 
     parts.append("<h2>3. Like-for-like comparison at matched approval rate</h2>")
     parts.append(_matched_ar_section(result, gates))
@@ -819,6 +913,15 @@ def render_markdown_report(result, title="Segment scorecard evaluation", gates=N
     lines.append("## 2. Per-segment verdicts")
     lines.append("")
     lines.append(_markdown_table(decision_table(result)))
+    lines.append("")
+    lines.append("## 2b. Portfolio WoE grouping")
+    lines.append("")
+    lines.append(
+        _markdown_table(
+            getattr(result, "grouping_summary", None),
+            ["feature", "kind", "method", "n_bins", "iv", "univariate_gini", "monotonic", "notes"],
+        )
+    )
     lines.append("")
     lines.append("## 3. Matched approval-rate comparison")
     lines.append("")

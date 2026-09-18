@@ -14,6 +14,7 @@ from scorecard_segment_eval.decision import (
     is_important,
     q1_verdict,
     q2_action,
+    q2_portfolio_action,
 )
 from scorecard_segment_eval.metrics import (
     MATCHED_AR_KEYS,
@@ -33,6 +34,9 @@ from scorecard_segment_eval.refit import (
 )
 from scorecard_segment_eval.schema import Gates, ScorecardColumns
 from scorecard_segment_eval.stability import predictor_stability
+
+OVERALL_SEGMENT_COL = "__overall__"
+OVERALL_SEGMENT_VALUE = "ALL"
 
 STABILITY_RESULT_KEYS = (
     "refit_method",
@@ -57,6 +61,7 @@ class SegmentEvalResult:
     vintage: pd.DataFrame
     stability: pd.DataFrame = field(default_factory=pd.DataFrame)
     grouping_comparison: pd.DataFrame = field(default_factory=pd.DataFrame)
+    grouping_summary: pd.DataFrame = field(default_factory=pd.DataFrame)
     fitted_artifacts: List[FittedModelArtifact] = field(default_factory=list)
     meta: Dict[str, Any] = field(default_factory=dict)
 
@@ -466,6 +471,206 @@ def _dominant_psi_method(char):
     return str(counts.index[0])
 
 
+def is_overall_segment(segment_col, segment_value=None):
+    # type: (Any, Any) -> bool
+    """True for the synthetic portfolio row ``__overall__`` / ``ALL``."""
+    if str(segment_col) != OVERALL_SEGMENT_COL:
+        return False
+    if segment_value is None:
+        return True
+    return str(segment_value) == OVERALL_SEGMENT_VALUE
+
+
+def _portfolio_grouping_summary(obs, cols, grouping):
+    # type: (pd.DataFrame, ScorecardColumns, Optional[BinningModel]) -> pd.DataFrame
+    """IV, bin count and univariate Gini of the production WoE grouping."""
+    if grouping is None or obs is None or obs.empty:
+        return pd.DataFrame()
+    table = grouping.iv_table()
+    if table is None or table.empty:
+        return pd.DataFrame()
+    y = None
+    if cols.col_target is not None and cols.col_target in obs.columns:
+        y = obs[cols.col_target].to_numpy(dtype=float)
+    ginis = []
+    for feature in table["feature"].tolist():
+        spec = grouping.specs.get(feature) if grouping.specs else None
+        if spec is None or feature not in obs.columns or y is None:
+            ginis.append(float("nan"))
+            continue
+        woe = spec.transform_woe(obs[feature])
+        is_logit = spec.kind == "logit" or spec.transform == "logit"
+        score = woe if is_logit else -woe
+        # Fold through a sigmoid so metrics.gini (which clips to a PD) keeps rank.
+        pd_hat = 1.0 / (1.0 + np.exp(-np.clip(np.asarray(score, dtype=float), -30, 30)))
+        ginis.append(gini(y, pd_hat))
+    out = table.copy()
+    out["univariate_gini"] = ginis
+    out["segment_col"] = OVERALL_SEGMENT_COL
+    out["segment_value"] = OVERALL_SEGMENT_VALUE
+    return out
+
+
+def _evaluate_portfolio(
+    df,
+    obs_all,
+    cols,
+    gates,
+    grouping,
+    overall,
+    n_all,
+    defaults_all,
+    n_jobs,
+    submodel=False,
+    xgb_params=None,
+    whatif=False,
+):
+    # type: (pd.DataFrame, pd.DataFrame, ScorecardColumns, Gates, Optional[BinningModel], Dict[str, float], int, float, Optional[int], bool, Optional[Dict[str, Any]], bool) -> Dict[str, Any]
+    """Q1 (and optional what-if refit) for the pooled book."""
+    fan_all = fantomas_mask(df, cols)
+    ratio, vint = _vintage_ratio(obs_all, cols)
+    if not vint.empty:
+        vint = vint.assign(segment_col=OVERALL_SEGMENT_COL, segment_value=OVERALL_SEGMENT_VALUE)
+    grouping_summary = _portfolio_grouping_summary(obs_all, cols, grouping)
+
+    q1, failed = q1_verdict(
+        n=overall.get("n", 0),
+        defaults=overall.get("defaults", 0),
+        gini_seg=overall.get("gini", float("nan")),
+        gini_ci_low=overall.get("gini_ci_low", float("nan")),
+        gini_overall=overall.get("gini", float("nan")),
+        oe=overall.get("oe", float("nan")),
+        ece_val=overall.get("ece", float("nan")),
+        vintage_ratio=ratio,
+        gates=gates,
+    )
+    do_recal = q1 == "WEAK" and "rank_order" not in failed and "calibration" in failed
+    do_refit = False
+    if whatif:
+        do_refit = True
+        do_recal = True
+    hold, refit_stability, artifacts, grouping_notes = _run_holdout_models(
+        obs_all,
+        cols,
+        gates,
+        do_refit=do_refit,
+        do_recal=do_recal,
+        grouping=grouping,
+        submodel=submodel,
+        xgb_params=xgb_params,
+        n_jobs=n_jobs,
+        obs_all=obs_all,
+        segment_col=OVERALL_SEGMENT_COL,
+        segment_value=OVERALL_SEGMENT_VALUE,
+    )
+    hold.update(
+        {
+            "segment_col": OVERALL_SEGMENT_COL,
+            "segment_value": OVERALL_SEGMENT_VALUE,
+            "shape_divergent": False,
+            "whatif": bool(whatif),
+        }
+    )
+    if not grouping_notes.empty:
+        grouping_notes = grouping_notes.assign(
+            segment_col=OVERALL_SEGMENT_COL, segment_value=OVERALL_SEGMENT_VALUE
+        )
+    production_stability = _overall_stability(df, obs_all, cols, gates, grouping, n_jobs)
+    if not production_stability.empty:
+        production_stability = production_stability.assign(stability_source="production")
+    if not refit_stability.empty:
+        refit_stability = refit_stability.assign(
+            segment_col=OVERALL_SEGMENT_COL,
+            segment_value=OVERALL_SEGMENT_VALUE,
+            stability_source="refit",
+        )
+    stability_frames = []  # type: List[pd.DataFrame]
+    if not production_stability.empty:
+        stability_frames.append(production_stability)
+    if not refit_stability.empty:
+        stability_frames.append(refit_stability)
+    stability_table = ordered_concat(stability_frames)
+
+    action, reason = q2_portfolio_action(
+        q1=q1,
+        failed_pillars=failed,
+        delta_gini=hold.get("delta_gini"),
+        delta_gini_ci_low=hold.get("delta_gini_ci_low"),
+        brier_refit=hold.get("brier_refit"),
+        brier_pooled=hold.get("brier_pooled"),
+        logloss_refit=hold.get("logloss_refit"),
+        logloss_pooled=hold.get("logloss_pooled"),
+        gates=gates,
+        stability_pass_flag=bool(hold.get("stability_pass", True)),
+        stability_reason=str(hold.get("stability_reason", "") or ""),
+        whatif=bool(whatif),
+    )
+    overall_gini = overall.get("gini")
+    gini_ratio = 1.0 if overall_gini and overall_gini == overall_gini and overall_gini != 0 else float("nan")
+    summary = {
+        "segment_col": OVERALL_SEGMENT_COL,
+        "segment_value": OVERALL_SEGMENT_VALUE,
+        "slice": "observable",
+        "n_ttd": n_all,
+        "volume_share": 1.0,
+        "default_share": 1.0,
+        "fantomas_rate": float(fan_all.mean()) if n_all else float("nan"),
+        "important": True,
+    }
+    summary.update(overall)
+    summary.update(_empty_matched_ar_row())
+    decision = {
+        "segment_col": OVERALL_SEGMENT_COL,
+        "segment_value": OVERALL_SEGMENT_VALUE,
+        "q1_verdict": q1,
+        "failed_pillars": ",".join(failed),
+        "important": True,
+        "shape_divergent": False,
+        "q2_action": action,
+        "q2_reason": reason,
+        "volume_share": 1.0,
+        "default_share": 1.0 if defaults_all else 0.0,
+        "gini": overall.get("gini"),
+        "gini_ratio": gini_ratio,
+        "oe": overall.get("oe"),
+        "obs_rate": overall.get("obs_rate"),
+        "mean_pd": overall.get("mean_pd"),
+        "ece": overall.get("ece"),
+        "vintage_gini_ratio": ratio,
+        "ar_segment": None,
+        "ar_reference": None,
+        "ar_reference_cutoff": None,
+        "ar_gap": None,
+        "ar_gap_triggered": False,
+        "matched_ar": None,
+        "matched_ar_anchor": None,
+        "matched_ar_threshold_segment": None,
+        "matched_ar_threshold_reference": None,
+        "gini_at_matched_ar": None,
+        "gini_reference_at_matched_ar": None,
+        "gini_at_matched_ar_gap": None,
+        "gini_at_matched_ar_ratio": None,
+        "ar_artifact_suspected": False,
+        "psi_method": "grouping_bins" if grouping is not None else None,
+        "refit_method": hold.get("refit_method"),
+        "stability_score": hold.get("stability_score"),
+        "stability_pass": hold.get("stability_pass"),
+        "unstable_predictors": hold.get("unstable_predictors"),
+        "stability_reason": hold.get("stability_reason"),
+    }
+    return {
+        "summary_rows": [summary],
+        "decision": decision,
+        "refit": hold,
+        "characteristics": pd.DataFrame(),
+        "vintage": vint,
+        "stability": stability_table,
+        "fitted_artifacts": artifacts,
+        "grouping_comparison": grouping_notes,
+        "grouping_summary": grouping_summary,
+    }
+
+
 def _coerce_grouping(grouping):
     # type: (Any) -> Optional[BinningModel]
     """Accept a ``BinningModel`` or a parsed scorecard that carries one."""
@@ -487,9 +692,18 @@ def evaluate_segments(
     n_jobs=None,
     submodel=False,
     xgb_params=None,
+    portfolio_whatif=False,
+    include_segments=True,
 ):
-    # type: (pd.DataFrame, ScorecardColumns, Optional[Gates], Any, Optional[int], bool, Optional[Dict[str, Any]]) -> SegmentEvalResult
-    """Evaluate every segment value of every segmentation column.
+    # type: (pd.DataFrame, ScorecardColumns, Optional[Gates], Any, Optional[int], bool, Optional[Dict[str, Any]], bool, bool) -> SegmentEvalResult
+    """Evaluate the pooled book and every segment value of every segmentation column.
+
+    The pooled book is always scored as the synthetic segment ``__overall__`` /
+    ``ALL``: Gini, calibration (O/E, ECE) and vintage stability, plus the
+    production WoE grouping's IV / univariate Gini when ``grouping`` is
+    supplied.  Pass ``portfolio_whatif=True`` to also run a same-predictor
+    holdout refit on the whole book regardless of the Q1 verdict (see
+    :func:`evaluate_portfolio_whatif`).
 
     ``grouping`` is a :class:`~scorecard_segment_eval.binning.BinningModel`, or
     a parsed SQL scorecard (``ScorecardSQLModel`` / ``ResolvedMetadata``) whose
@@ -499,65 +713,76 @@ def evaluate_segments(
 
     ``n_jobs`` controls the per-segment fan-out (``None`` falls back to
     ``Gates.n_jobs``).  Results are identical for any worker count.
+    ``include_segments=False`` skips the per-segment loop and keeps only the
+    portfolio row.
     """
     grouping = _coerce_grouping(grouping)
     gates = gates or Gates()
     jobs = n_jobs if n_jobs is not None else gates.n_jobs
     obs_all = df.loc[observable_mask(df, cols)].copy()
-    fan_all = fantomas_mask(df, cols)
     overall = _slice_metrics(obs_all, cols, gates, n_jobs=jobs)
     overall_gini = overall["gini"]
     n_all = len(df)
     defaults_all = float(obs_all[cols.col_target].sum()) if len(obs_all) else 0.0
 
-    overall_row = {
-        "segment_col": "__overall__",
-        "segment_value": "ALL",
-        "slice": "observable",
-        "n_ttd": n_all,
-        "volume_share": 1.0,
-        "default_share": 1.0,
-        "fantomas_rate": float(fan_all.mean()) if n_all else float("nan"),
-        "important": True,
-    }
-    overall_row.update(overall)
-    overall_row.update(_empty_matched_ar_row())
+    portfolio = _evaluate_portfolio(
+        df,
+        obs_all,
+        cols,
+        gates,
+        grouping,
+        overall,
+        n_all,
+        defaults_all,
+        jobs,
+        submodel=submodel,
+        xgb_params=xgb_params,
+        whatif=bool(portfolio_whatif),
+    )
 
     tasks = []  # type: List[Dict[str, Any]]
-    for seg_col in cols.cols_segment or ():
-        if seg_col not in df.columns:
-            continue
-        for value, part in df.groupby(seg_col, dropna=False):
-            tasks.append(
-                {
-                    "segment_col": seg_col,
-                    "segment_value": value,
-                    "part": part,
-                    "obs_all": obs_all,
-                    "cols": cols,
-                    "gates": gates,
-                    "overall_gini": overall_gini,
-                    "defaults_all": defaults_all,
-                    "n_all": n_all,
-                    "grouping": grouping,
-                    "submodel": submodel,
-                    "xgb_params": xgb_params,
-                    # Inner loops stay serial: the outer fan-out already
-                    # saturates the pool and parallel.map_jobs refuses to nest.
-                    "inner_n_jobs": jobs,
-                }
-            )
+    if include_segments:
+        for seg_col in cols.cols_segment or ():
+            if seg_col not in df.columns:
+                continue
+            for value, part in df.groupby(seg_col, dropna=False):
+                tasks.append(
+                    {
+                        "segment_col": seg_col,
+                        "segment_value": value,
+                        "part": part,
+                        "obs_all": obs_all,
+                        "cols": cols,
+                        "gates": gates,
+                        "overall_gini": overall_gini,
+                        "defaults_all": defaults_all,
+                        "n_all": n_all,
+                        "grouping": grouping,
+                        "submodel": submodel,
+                        "xgb_params": xgb_params,
+                        # Inner loops stay serial: the outer fan-out already
+                        # saturates the pool and parallel.map_jobs refuses to nest.
+                        "inner_n_jobs": jobs,
+                    }
+                )
 
     outputs = map_jobs(_evaluate_one_segment, tasks, n_jobs=jobs, cap=gates.max_workers_cap)
 
-    summary_rows = [overall_row]
-    decision_rows = []  # type: List[Dict[str, Any]]
-    refit_rows = []  # type: List[Dict[str, Any]]
+    summary_rows = list(portfolio["summary_rows"])
+    decision_rows = [portfolio["decision"]]
+    refit_rows = [portfolio["refit"]]
     char_frames = []  # type: List[pd.DataFrame]
     vintage_frames = []  # type: List[pd.DataFrame]
     stability_frames = []  # type: List[pd.DataFrame]
     grouping_frames = []  # type: List[pd.DataFrame]
-    artifacts = []  # type: List[FittedModelArtifact]
+    artifacts = list(portfolio.get("fitted_artifacts") or [])
+    if portfolio.get("vintage") is not None and not portfolio["vintage"].empty:
+        vintage_frames.append(portfolio["vintage"])
+    if portfolio.get("stability") is not None and not portfolio["stability"].empty:
+        stability_frames.append(portfolio["stability"])
+    grouping_notes = portfolio.get("grouping_comparison", pd.DataFrame())
+    if grouping_notes is not None and not grouping_notes.empty:
+        grouping_frames.append(grouping_notes)
     for out in outputs:
         summary_rows.extend(out["summary_rows"])
         decision_rows.append(out["decision"])
@@ -568,15 +793,6 @@ def evaluate_segments(
         grouping_frames.append(out.get("grouping_comparison", pd.DataFrame()))
         artifacts.extend(out.get("fitted_artifacts") or [])
 
-    overall_stability = _overall_stability(df, obs_all, cols, gates, grouping, jobs)
-    if not overall_stability.empty:
-        stability_frames.insert(0, overall_stability)
-
-    _ratio_all, overall_vint = _vintage_ratio(obs_all, cols)
-    if not overall_vint.empty:
-        overall_vint = overall_vint.assign(segment_col="__overall__", segment_value="ALL")
-        vintage_frames.insert(0, overall_vint)
-
     meta = {
         "n_rows": int(len(df)),
         "n_observable": int(len(obs_all)),
@@ -586,6 +802,8 @@ def evaluate_segments(
         "grouping_supplied": grouping is not None,
         "pred_woe_map": cols.pred_woe_map(),
         "n_fitted_artifacts": len(artifacts),
+        "portfolio_whatif": bool(portfolio_whatif),
+        "include_segments": bool(include_segments),
         "gates": dict(gates.__dict__),
         "columns": cols.as_dict(),
     }
@@ -597,8 +815,44 @@ def evaluate_segments(
         vintage=ordered_concat(vintage_frames),
         stability=ordered_concat(stability_frames),
         grouping_comparison=ordered_concat(grouping_frames),
+        grouping_summary=portfolio.get("grouping_summary", pd.DataFrame()),
         fitted_artifacts=artifacts,
         meta=meta,
+    )
+
+
+def evaluate_portfolio_whatif(
+    df,
+    cols,
+    gates=None,
+    grouping=None,
+    n_jobs=None,
+    submodel=False,
+    xgb_params=None,
+):
+    # type: (pd.DataFrame, ScorecardColumns, Optional[Gates], Any, Optional[int], bool, Optional[Dict[str, Any]]) -> SegmentEvalResult
+    """What-if: refit the pooled scorecard on the whole book.
+
+    Evaluates portfolio-level Gini, calibration and vintage / WoE-grouping
+    stability, then *always* runs a same-predictor holdout refit and a
+    two-parameter PD recalibration, regardless of the Q1 verdict.  Per-segment
+    cells are skipped; the result contains the ``__overall__`` / ``ALL`` row
+    only.
+
+    Use this when the question is "would re-estimating the same predictors on
+    recent data beat the production PD?", not "is a dedicated segment model
+    warranted?".
+    """
+    return evaluate_segments(
+        df,
+        cols,
+        gates=gates,
+        grouping=grouping,
+        n_jobs=n_jobs,
+        submodel=submodel,
+        xgb_params=xgb_params,
+        portfolio_whatif=True,
+        include_segments=False,
     )
 
 
