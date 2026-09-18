@@ -1,7 +1,8 @@
 """Sub-population evaluation for logistic scorecards.
 
-Q1: is the pooled score good on each business segment?
+Q1: is the pooled score good on each business segment, and on the book?
 Q2: is a same-predictor refit worth a split, or is recalibration enough?
+A portfolio what-if asks the same refit question of the pooled scorecard.
 
 The package is written to run on Python 3.6 and up: annotations use
 ``typing`` generics in comment form, and on 3.6 ``dataclasses`` is pulled in
@@ -30,8 +31,15 @@ from scorecard_segment_eval.dbio import (
     available_queries,
     render_sql,
 )
-from scorecard_segment_eval.decision import q1_verdict, q2_action
-from scorecard_segment_eval.evaluate import SegmentEvalResult, evaluate_segments
+from scorecard_segment_eval.decision import q1_verdict, q2_action, q2_portfolio_action
+from scorecard_segment_eval.evaluate import (
+    OVERALL_SEGMENT_COL,
+    OVERALL_SEGMENT_VALUE,
+    SegmentEvalResult,
+    evaluate_portfolio_whatif,
+    evaluate_segments,
+    is_overall_segment,
+)
 from scorecard_segment_eval.metrics import matched_ar_comparison, performance_bundle
 from scorecard_segment_eval.parallel import map_jobs, resolve_n_jobs
 from scorecard_segment_eval.refit import (
@@ -95,10 +103,15 @@ __all__ = [
     # evaluation
     "SegmentEvalResult",
     "evaluate_segments",
+    "evaluate_portfolio_whatif",
+    "is_overall_segment",
+    "OVERALL_SEGMENT_COL",
+    "OVERALL_SEGMENT_VALUE",
     "performance_bundle",
     "matched_ar_comparison",
     "q1_verdict",
     "q2_action",
+    "q2_portfolio_action",
     # binning / grouping
     "BinSpec",
     "BinningModel",

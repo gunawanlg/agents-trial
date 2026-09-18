@@ -447,4 +447,4 @@ def test_resolved_metadata_feeds_evaluate_segments_end_to_end():
         df, meta.columns, Gates(min_n=300, min_events=20, n_bootstrap=30, bootstrap_seed=0)
     )
     assert not result.decisions.empty
-    assert set(result.decisions["segment_col"]) == {"CHANNEL"}
+    assert set(result.decisions["segment_col"]) == {"CHANNEL", "__overall__"}

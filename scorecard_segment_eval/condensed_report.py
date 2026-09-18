@@ -38,7 +38,7 @@ from scorecard_segment_eval.report import (
 from scorecard_segment_eval.schema import Gates
 
 _INDEX_COLS = ("segment_col", "segment_value")
-_COMPARE_ACTIONS = ("KEEP_POOLED", "MONITOR", "SPLIT")
+_COMPARE_ACTIONS = ("KEEP_POOLED", "MONITOR", "SPLIT", "REFIT")
 _AR_GAP_FLOOR = 0.10
 _PSI_FLOOR = 0.25
 
@@ -460,10 +460,12 @@ def _verdict_table(result, sql_map):
                 cells.append("<td%s>%s</td>" % (attr, _cell(row[col], col) if col != "stability_reason" else html_safe(row[col] or "-")))
         body.append("<tr>" + "".join(cells) + "</tr>")
     note = (
-        '<p class="note"><strong>KEEP_POOLED</strong>, <strong>MONITOR</strong> and '
-        "<strong>SPLIT</strong> show holdout <code>gini_refit</code> vs <code>gini_pooled</code> "
+        '<p class="note"><strong>KEEP_POOLED</strong>, <strong>MONITOR</strong>, '
+        "<strong>SPLIT</strong> and <strong>REFIT</strong> show holdout "
+        "<code>gini_refit</code> vs <code>gini_pooled</code> "
         "and the stability reason. The last column downloads the refit <code>scorecard.sql</code> "
-        "when a logistic artefact exists.</p>"
+        "when a logistic artefact exists. <code>__overall__</code> / <code>ALL</code> is the "
+        "pooled book.</p>"
     )
     return note + (
         '<div class="scroll"><table class="frozen"><thead><tr>'
@@ -789,14 +791,36 @@ def _plot_woe_bars(part, title):
 
 def _grouping_section(result):
     # type: (SegmentEvalResult) -> str
+    summary = getattr(result, "grouping_summary", None)
+    summary_block = ""
+    if summary is not None and not summary.empty:
+        summary_block = (
+            '<p class="note">Production WoE grouping on the observable book '
+            "(<code>__overall__</code>).</p>"
+            + frozen_html_table(
+                summary,
+                [
+                    "feature",
+                    "kind",
+                    "method",
+                    "n_bins",
+                    "iv",
+                    "univariate_gini",
+                    "monotonic",
+                    "notes",
+                ],
+                empty_message="",
+            )
+        )
     cmp_ = getattr(result, "grouping_comparison", None)
     intro = (
         '<p class="note">Only bins whose grouping comparison is not <code>aligned</code> and '
         "is marked significant are shown. The plot is segment WoE vs portfolio WoE for that "
-        "<code>(segment_col, segment_value)</code> feature.</p>"
+        "<code>(segment_col, segment_value)</code> feature. A portfolio what-if refit shows "
+        "the new bins against the production grouping on <code>__overall__</code>.</p>"
     )
     if cmp_ is None or cmp_.empty:
-        return intro + '<p class="note">No grouping comparison was produced.</p>'
+        return summary_block + intro + '<p class="note">No grouping comparison was produced.</p>'
     kind = cmp_["kind"].astype(str) if "kind" in cmp_.columns else pd.Series([""] * len(cmp_))
     if "significant" in cmp_.columns:
         sig = cmp_["significant"].map(lambda v: str(v).lower() in ("true", "yes", "1"))
@@ -804,7 +828,11 @@ def _grouping_section(result):
         sig = pd.Series([False] * len(cmp_))
     keep = cmp_.loc[(kind != "aligned") & sig]
     if keep.empty:
-        return intro + '<p class="note">Every compared bin is aligned; nothing significant to show.</p>'
+        return (
+            summary_block
+            + intro
+            + '<p class="note">Every compared bin is aligned; nothing significant to show.</p>'
+        )
     display = keep.copy()
     if "portfolio_bins" in display.columns and "portfolio_bin" not in display.columns:
         display["portfolio_bin"] = display["portfolio_bins"]
@@ -872,7 +900,7 @@ def _grouping_section(result):
         figures.append(
             '<h3 id="%s">%s</h3>' % (html_safe(anchor), html_safe(title)) + _plot_woe_bars(part, title)
         )
-    return intro + table + "".join(figures)
+    return summary_block + intro + table + "".join(figures)
 
 
 def _stability_flag_viz(row, gates):

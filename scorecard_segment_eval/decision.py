@@ -109,6 +109,56 @@ def ar_artifact_suspected(
     return False
 
 
+def _refit_clears_performance_gates(
+    delta_gini,
+    delta_gini_ci_low,
+    brier_refit,
+    brier_pooled,
+    logloss_refit,
+    logloss_pooled,
+    gates,
+    require_shape=True,
+    shape_divergent=False,
+):
+    # type: (Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Gates, bool, bool) -> Tuple[bool, str]
+    """Whether a holdout refit beats the pooled score enough to act on.
+
+    Returns ``(ok, reason_if_not)``.  ``require_shape`` is the segment-vs-
+    portfolio WoE-divergence gate; the portfolio what-if drops it because
+    there is no parent book to diverge from.
+    """
+    if delta_gini is None or not (delta_gini == delta_gini):
+        return False, "need_new_information_not_new_coefficients"
+    brier_ok = (
+        brier_refit is not None
+        and brier_pooled is not None
+        and brier_refit == brier_refit
+        and brier_pooled == brier_pooled
+        and brier_refit < brier_pooled
+    )
+    logloss_ok = (
+        logloss_refit is not None
+        and logloss_pooled is not None
+        and logloss_refit == logloss_refit
+        and logloss_pooled == logloss_pooled
+        and logloss_refit < logloss_pooled
+    )
+    proper_ok = brier_ok or logloss_ok
+    ci_ok = (
+        delta_gini_ci_low is not None
+        and delta_gini_ci_low == delta_gini_ci_low
+        and delta_gini_ci_low > 0
+    )
+    material = delta_gini >= gates.min_delta_gini
+    if require_shape and not shape_divergent:
+        return False, "split_gates_failed"
+    if material and ci_ok and proper_ok:
+        return True, ""
+    if not material:
+        return False, "need_new_information_not_new_coefficients"
+    return False, "split_gates_failed"
+
+
 def q2_action(
     q1,
     failed_pillars,
@@ -181,3 +231,62 @@ def q2_action(
     if not rank_ok:
         return "KEEP_POOLED", "need_new_information_not_new_coefficients"
     return "KEEP_POOLED", "split_gates_failed"
+
+
+def q2_portfolio_action(
+    q1,
+    failed_pillars,
+    delta_gini,
+    delta_gini_ci_low,
+    brier_refit,
+    brier_pooled,
+    logloss_refit,
+    logloss_pooled,
+    gates,
+    stability_pass_flag=True,
+    stability_reason="",
+    whatif=False,
+):
+    # type: (str, List[str], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Gates, bool, str, bool) -> Tuple[str, str]
+    """Decide the action for the pooled book (``__overall__`` / ``ALL``).
+
+    There is no parent portfolio to split from, so ``SPLIT`` is never
+    returned.  The what-if path (``whatif=True``) always inspects a
+    same-predictor holdout refit: if it beats the production PD on Gini
+    *and* a proper score, the action is ``REFIT`` (or ``MONITOR`` when the
+    predictors are unstable).  Without ``whatif`` the book is only
+    recalibrated when ranking holds and calibration fails.
+    """
+    if q1 == "INCONCLUSIVE":
+        return "NONE", "insufficient_power"
+    rank_ok = "rank_order" not in failed_pillars
+    cal_ok = "calibration" not in failed_pillars
+    if whatif:
+        performance_ok, fail_reason = _refit_clears_performance_gates(
+            delta_gini,
+            delta_gini_ci_low,
+            brier_refit,
+            brier_pooled,
+            logloss_refit,
+            logloss_pooled,
+            gates,
+            require_shape=False,
+            shape_divergent=False,
+        )
+        if performance_ok and gates.refit_requires_stability and not stability_pass_flag:
+            reason = "refit_predictors_unstable"
+            if stability_reason:
+                reason = reason + ":" + str(stability_reason)
+            return "MONITOR", reason
+        if performance_ok:
+            return "REFIT", "holdout_delta_gini_portfolio"
+        if rank_ok and not cal_ok:
+            return "RECALIBRATE", "rank_order_ok_calibration_fail"
+        if q1 == "GOOD":
+            return "KEEP_POOLED", "performance_good"
+        return "KEEP_POOLED", fail_reason or "need_new_information_not_new_coefficients"
+    if rank_ok and not cal_ok:
+        return "RECALIBRATE", "rank_order_ok_calibration_fail"
+    if q1 == "GOOD":
+        return "KEEP_POOLED", "performance_good"
+    return "KEEP_POOLED", "need_new_information_not_new_coefficients"
